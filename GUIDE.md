@@ -739,6 +739,9 @@ other structure the corporation owns.
   station and sells into the order only when the source price is covered (an
   order that does not pay is retried after an hour).
   `/playerbots orders` lists the orders bots see and who is handling each.
+  Goods sold into a buy order paid from a corporation wallet go to
+  **Corporation Deliveries** at the order's station; goods for a personal
+  buy order go to the buyer's own hangar.
 
 To reseed the market this way after a full rebuild: stop `server` and
 `market`, back up with `market-tools backup`, delete `seed_stock` and

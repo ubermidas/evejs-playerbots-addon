@@ -424,8 +424,8 @@
     },
     "server/src/services/market/marketProxyService.js": {
       "baseSha256": "3b8c2a5005c1003e2067f467a8e63e2aca4c6f683c4941622f311b58274171ca",
-      "sourceSha256": "eae81ba40e80ff6457b179a62f6a22231d4fde9bcebd7628c21bfdb263691c07",
-      "overlaySha256": "eae81ba40e80ff6457b179a62f6a22231d4fde9bcebd7628c21bfdb263691c07",
+      "sourceSha256": "f669c3cc94f66d3054faf05bb3635c56ad2d4ffe850b77aee70b35a54b369c84",
+      "overlaySha256": "f669c3cc94f66d3054faf05bb3635c56ad2d4ffe850b77aee70b35a54b369c84",
       "subsystem": "economy-authorities"
     },
     "server/src/services/mining/miningNpcOperations.js": {

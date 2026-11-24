@@ -3,6 +3,17 @@
 Newest first. The Docker add-on keeps the upstream version number (0.2.152);
 the Windows launcher package adds a fourth number for its own releases.
 
+## Unreleased: corporation buy orders deliver to Corporation Deliveries
+
+On the `fix/corp-deliveries` branch of the ubermidas fork.
+
+- **Corporation buy orders deliver to the corporation.** When a bot (or
+  anyone) sells into a buy order paid from a corporation wallet, the goods now
+  go to Corporation Deliveries at the order's station, as in EVE. Before, they
+  went to the personal hangar of the member who placed the order. Personal buy
+  orders are unchanged, and a sale already in progress during the upgrade
+  finishes where it started. (`marketProxyService.js`)
+
 ## Unreleased: housekeeping
 
 On the `housekeeping` branch of the ubermidas fork, offered upstream.

@@ -5033,6 +5033,13 @@ function buildPlayerBuyFillSaga({
         : `Inventory item ${normalizePositiveInteger(sourceItemID, 0)} did not contain enough items.`,
     });
   }
+  // A buy order paid from a corporation wallet buys for the corporation, as in
+  // EVE: whoever sells into it (a player or a playerbot) delivers the goods to
+  // Corporation Deliveries at the order's station, not to the personal hangar
+  // of the member who placed the order.
+  const corporationBuyerID = escrowRecord && escrowRecord.isCorp
+    ? normalizePositiveInteger(escrowRecord.walletOwnerId, 0)
+    : 0;
 
   return {
     schemaVersion: 1,
@@ -5049,6 +5056,10 @@ function buildPlayerBuyFillSaga({
     sellerIsCorp,
     sellerAccountKey,
     destinationStationID,
+    // Where the goods go. Sagas saved before these fields existed have
+    // neither and keep delivering to the buyer's hangar when recovered.
+    deliveryOwnerID: corporationBuyerID || buyerCharacterID,
+    deliveryFlagID: corporationBuyerID ? ITEM_FLAGS.CORP_DELIVERIES : ITEM_FLAGS.HANGAR,
     typeID,
     fillableQuantity,
     availableQuantity,
@@ -5181,9 +5192,9 @@ async function executePlayerBuyFillSagaUnlocked(
       }
       const moveResult = marketItemCustody.transferItem({
         item: leg.sourceItem,
-        ownerID: saga.buyerCharacterID,
+        ownerID: normalizePositiveInteger(saga.deliveryOwnerID, 0) || saga.buyerCharacterID,
         locationID: saga.destinationStationID,
-        flagID: ITEM_FLAGS.HANGAR,
+        flagID: Number.isInteger(saga.deliveryFlagID) ? saga.deliveryFlagID : ITEM_FLAGS.HANGAR,
         quantity: leg.quantity,
         ...(saga.sourceOrderID ? { orderID: saga.sourceOrderID } : {}),
         actor: saga.sellerCharacterID,
