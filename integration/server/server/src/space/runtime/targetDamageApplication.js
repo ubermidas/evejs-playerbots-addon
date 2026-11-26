@@ -419,6 +419,11 @@ function applyWeaponDamageToTarget(
     ? resolveLayerResonanceOverrides(scene, attackerEntity, targetEntity) : null;
   if (layerResonanceOverrides) damageOptions.layerResonanceOverrides = layerResonanceOverrides;
   const incursionBefore = targetEntity.incursionOperationID ? { ...targetEntity.conditionState } : null;
+  const fwHub = targetEntity.fwHub && require("../../services/faction/fwHubRuntime");
+  const hubNow = fwHub ? require("./runtimeClock").getWallclockNowMs() : null;
+  const hubHit = fwHub && fwHub.prepareHit(scene, attackerEntity, targetEntity,
+    buildCombatDestructionOwnerContext(attackerEntity).ownerCharacterID, hubNow);
+  if (fwHub && !hubHit) return { damageResult: null, destroyResult: null, errorMsg: "FW_HUB_INVULNERABLE" };
   const damageResult = breacherTick
     ? applyResolvedDamageAmountToEntity(targetEntity, options.resolvedDamageAmount)
     : fighterDamageContext && fighterDamageContext.damageResult
@@ -433,6 +438,17 @@ function applyWeaponDamageToTarget(
     if (!incursion.success || incursion.pending) return {
       damageResult: { success: false, errorMsg: incursion.errorMsg || "INCURSION_HEALTH_PENDING", pending: incursion.pending }, destroyResult: null,
     };
+  }
+  if (fwHub && damageResult.success && getAppliedDamageAmount(damageResult) > 0) {
+    let transferAtMs;
+    try {
+      transferAtMs = fwHub.commitHit(targetEntity, hubHit, damageResult, hubNow);
+    } catch (error) {
+      targetEntity.conditionState = hubHit.before;
+      log.warn(`[FW] Hub damage checkpoint failed: ${error.message}`);
+      return { damageResult: null, destroyResult: null, errorMsg: "FW_HUB_CHECKPOINT_FAILED" };
+    }
+    if (transferAtMs) fwHub.publishLost(scene, targetEntity, transferAtMs, whenMs);
   }
   if (breacherTick && damageResult.success) {
     // Cursor, lethal intent and health commit together in the existing ship

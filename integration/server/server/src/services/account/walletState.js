@@ -83,6 +83,7 @@ const JOURNAL_ENTRY_TYPE = {
   JUMP_CLONE_ACTIVATION: 128,
   SKILL_PURCHASE: 141,
   MARKET_PROVIDER_TAX: 149,
+  MARKET_SECURITY_TAX: 194, // appConst.refMarketSecurityTax.
   // appConst.refDatacoreFee -- the ISK half of an R&D datacore purchase.
   DATACORE_FEE: 112,
   // Installed appConst.refAssetSafetyTax; charged when items leave a safety wrap.
@@ -173,6 +174,9 @@ function findWalletOperationReceipt(record, idempotencyKey) {
   if (idempotencyKey.startsWith("contract:") && record.contractWalletReceipts?.[idempotencyKey]) return record.contractWalletReceipts[idempotencyKey];
   if (idempotencyKey.startsWith("freelance:")) return record.freelanceWalletReceipts?.[idempotencyKey] || null;
   if (idempotencyKey.startsWith("nodegraph:")) return record.nodeGraphWalletReceipts?.[idempotencyKey] || null;
+  // Achievement ISK rewards keep their receipts in a map of their own. A receipt an earlier build wrote to the
+  // general list (newest 512 only) is still honoured, so a claim that was credited before the upgrade stays paid.
+  if (idempotencyKey.startsWith("achievement:") && record.achievementWalletReceipts?.[idempotencyKey]) return record.achievementWalletReceipts[idempotencyKey];
   return Array.isArray(record && record.walletOperationReceipts)
     ? record.walletOperationReceipts.find(
         (receipt) => receipt && receipt.idempotencyKey === idempotencyKey,
@@ -208,6 +212,10 @@ function appendWalletOperationReceipt(record, receipt) {
   }
   if (receipt.idempotencyKey.startsWith("nodegraph:")) {
     record.nodeGraphWalletReceipts = { ...(record.nodeGraphWalletReceipts || {}), [receipt.idempotencyKey]: cloneValue(receipt) };
+    return;
+  }
+  if (receipt.idempotencyKey.startsWith("achievement:")) {
+    record.achievementWalletReceipts = { ...(record.achievementWalletReceipts || {}), [receipt.idempotencyKey]: cloneValue(receipt) };
     return;
   }
   const receipts = Array.isArray(record && record.walletOperationReceipts)
@@ -837,6 +845,9 @@ function applyAdjustCharacterBalance({ charId, amount, options = {} }) {
     if (idempotencyKey.startsWith("campaign:") && Object.keys(currentRecord.campaignWalletReceipts || {}).length >= 8192) {
       return { success: false, errorMsg: "CAMPAIGN_WALLET_RECEIPT_LIMIT" };
     }
+    if (idempotencyKey.startsWith("achievement:") && Object.keys(currentRecord.achievementWalletReceipts || {}).length >= 8192) {
+      return { success: false, errorMsg: "ACHIEVEMENT_WALLET_RECEIPT_LIMIT" };
+    }
   }
 
   const currentWallet = getCharacterWallet(charId);
@@ -877,7 +888,7 @@ async function adjustCharacterBalanceAsync(charId, amount, options = {}, metadat
   // Contract journals may acknowledge this leg immediately. In local execution
   // the owner record and its permanent receipt must reach SQLite first; process
   // execution already provides this barrier inside the wallet owner.
-  if (result?.success && ["contract-settlement", "campaign-redemption", "career-reward", "incursion-settlement"].includes(metadata.source) && !isWalletAuthorityProcessEnabled()) {
+  if (result?.success && ["contract-settlement", "campaign-redemption", "career-reward", "achievement-reward", "incursion-settlement"].includes(metadata.source) && !isWalletAuthorityProcessEnabled()) {
     const database = require("../../gameStore");
     const committed = database.flushTableSync("characters");
     if (!committed?.success) return committed || { success: false, errorMsg: "CONTRACT_WALLET_FLUSH_FAILED" };

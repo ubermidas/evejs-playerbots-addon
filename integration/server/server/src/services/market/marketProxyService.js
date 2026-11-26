@@ -6,6 +6,8 @@ const path = require("path");
 const BaseService = require(path.join(__dirname, "../baseService"));
 const database = require(path.join(__dirname, "../../gameStore"));
 const log = require(path.join(__dirname, "../../utils/logger"));
+const { getAverageMarketPrices } = require("../_shared/averageMarketPrices");
+const { computeExordiumMarketSecurityTax } = require("../security/securityTax");
 const achievementRuntime = require(path.join(
   __dirname,
   "../achievement/achievementRuntime",
@@ -25,6 +27,7 @@ const {
   buildList,
   buildRowset,
   buildFiletimeLong,
+  currentFileTime,
   normalizeBigInt,
 } = require(path.join(__dirname, "../_shared/serviceHelpers"));
 const { marketDaemonClient } = require(path.join(
@@ -43,6 +46,7 @@ const {
   getCharacterMarketTransactions,
   getCharacterWallet,
 } = require(path.join(__dirname, "../account/walletState"));
+const { isWalletAuthorityProcessEnabled } = require("../account/walletCommandAuthority");
 const {
   adjustCorporationWalletDivisionBalanceAsync,
   appendCorporationMarketTransactionAsync,
@@ -126,6 +130,7 @@ const {
   getStationDistanceFromSession,
   isAllowedBuyRange,
   isAllowedDuration,
+  roundOrderPriceToTick,
 } = require(path.join(__dirname, "./marketRules"));
 const {
   getMarketRuntimeState,
@@ -235,7 +240,9 @@ let EMPTY_ORDER_ROWSET = null;
 const EMPTY_OWNER_ORDER_ROWSET = buildRowset(OWNER_ORDER_HEADER, [], ROWSET_NAME);
 
 const FILETIME_EPOCH_OFFSET = 116444736000000000n;
+const MARKET_TRANSACTION_DEFAULT_WINDOW = 30n * 24n * 60n * 60n * 10_000_000n;
 const PLEX_TYPE_ID = 44992;
+const CONCORD_CORPORATION_ID = 1000125;
 // Matches the bit this codebase already uses for the Trader role elsewhere
 // (server/src/services/corporation/corporationRuntimeState.js); re-declared
 // locally rather than exported/imported, following this file's own pattern
@@ -508,8 +515,8 @@ function buildHistoryPair(historyRows = []) {
 
 function mapOwnerOrderStateCode(state) {
   switch (String(state || "").trim().toLowerCase()) {
+    // History renders state 2 as Completed when there is no volume remaining.
     case "filled":
-      return 1;
     case "expired":
       return 2;
     case "cancelled":
@@ -1249,6 +1256,15 @@ function recordCompletedMarketFillAchievements(saga = {}) {
       operationKey,
     ));
   }
+  // "Buy items through the Regional Marketplace" counts the items of a completed fill for the buyer, whichever
+  // side (a buyer taking a sell order, or a buy order a seller filled) completed it.
+  if (normalizePositiveInteger(saga.buyerCharacterID, 0)) {
+    results.push(achievementRuntime.recordRegionalMarketItemPurchase(saga.buyerCharacterID, {
+      typeID: saga.typeID,
+      quantity: saga.tradedQuantity ?? saga.fillableQuantity,
+      receiptID: operationKey,
+    }));
+  }
   if (normalizePositiveInteger(saga.sellerCharacterID, 0) && saleAmount > 0) {
     results.push(achievementRuntime.recordMarketSale(
       saga.sellerCharacterID,
@@ -1308,15 +1324,18 @@ async function creditStructureMarketBrokerFeeOwner(
   stationID,
   amount,
   description,
+  options = {},
 ) {
   const normalizedAmount = roundIsk(amount);
   if (!(normalizedAmount > 0)) {
     return null;
   }
 
-  const structure = getStructureMarketLocation(stationID);
+  const structure = options.ownerCorpID === undefined
+    ? getStructureMarketLocation(stationID)
+    : null;
   const ownerCorpID = normalizePositiveInteger(
-    structure && (structure.ownerCorpID || structure.ownerID),
+    options.ownerCorpID ?? (structure && (structure.ownerCorpID || structure.ownerID)),
     0,
   );
   if (!ownerCorpID) {
@@ -1333,6 +1352,7 @@ async function creditStructureMarketBrokerFeeOwner(
       ownerID2: ownerCorpID,
       referenceID: normalizePositiveInteger(stationID, 0),
       entryTypeID: JOURNAL_ENTRY_TYPE.BROKERS_FEE,
+      idempotencyKey: options.idempotencyKey,
     },
   );
   if (!creditResult || creditResult.success !== true) {
@@ -1478,7 +1498,7 @@ function ensureValidDuration(durationDays) {
   }
 }
 
-function ensureValidBuyRange(rangeValue, limits) {
+function ensureValidBuyRange(rangeValue, visibilityRange) {
   const normalizedRange = normalizeInteger(rangeValue, RANGE_STATION);
   if (!isAllowedBuyRange(normalizedRange)) {
     throwWrappedUserError("CustomInfo", {
@@ -1486,19 +1506,14 @@ function ensureValidBuyRange(rangeValue, limits) {
     });
   }
 
-  if (
-    normalizedRange === RANGE_REGION &&
-    normalizeInteger(limits && limits.vis, RANGE_STATION) !== RANGE_REGION
-  ) {
+  const maxRange = normalizeInteger(visibilityRange, RANGE_STATION);
+  if (normalizedRange === RANGE_REGION && maxRange !== RANGE_REGION) {
     throwWrappedUserError("CustomInfo", {
       info: "The current Visibility skill level does not allow region-wide buy orders.",
     });
   }
 
-  if (
-    normalizedRange !== RANGE_REGION &&
-    normalizedRange > normalizeInteger(limits && limits.vis, RANGE_STATION)
-  ) {
+  if (normalizedRange !== RANGE_REGION && normalizedRange > maxRange) {
     throwWrappedUserError("CustomInfo", {
       info: "The current Visibility skill level does not allow that buy-order range.",
     });
@@ -1525,6 +1540,12 @@ function ensureValidPrice(price) {
       info: `The market order price cannot exceed ${MARKET_MAX_ORDER_PRICE.toFixed(2)} ISK.`,
     });
   }
+}
+
+function getValidatedStandingOrderPrice(price, isBuy) {
+  const alignedPrice = roundOrderPriceToTick(price, isBuy);
+  ensureValidPrice(alignedPrice);
+  return alignedPrice;
 }
 
 function ensureOpenOrderLimit(context, openOrders = []) {
@@ -1556,12 +1577,15 @@ function getMarketLocationSolarSystemID(stationID) {
   return normalizePositiveInteger(structure && structure.solarSystemID, 0);
 }
 
-function ensureRemoteBuyOrderPlacementAllowed(session, stationID, context) {
+function ensureStandingBuyOrderPlacementAllowed(session, stationID, orderRange, context) {
   const jumps = getStationDistanceFromSession(
     session,
     stationID,
     getMarketLocationSolarSystemID(stationID),
   );
+  // Visibility governs the fill range of remotely placed orders. The selected
+  // station or structure offers every valid range when the buyer is docked there.
+  ensureValidBuyRange(orderRange, jumps === RANGE_STATION ? RANGE_REGION : context.limits.vis);
   if (jumps > normalizeInteger(context && context.limits && context.limits.bid, RANGE_STATION)) {
     throwWrappedUserError("CustomInfo", {
       info: "The current Procurement skill level does not allow placing a buy order at that location.",
@@ -1691,7 +1715,11 @@ async function debitCharacterWallet(
     return null;
   }
 
-  ensureCharacterHasFunds(characterID, normalizedAmount, description, options);
+  // The wallet owner checks the receipt before checking funds. A replay may
+  // arrive after the original debit used the last available ISK.
+  if (!options.idempotencyKey) {
+    ensureCharacterHasFunds(characterID, normalizedAmount, description, options);
+  }
 
   if (options.isCorp) {
     const accountKey = normalizeCorporationWalletKey(options.accountKey);
@@ -1951,14 +1979,6 @@ function getStructureMarketLocation(stationID) {
     return null;
   }
   return structureState.getStructureByID(numericStationID) || null;
-}
-
-function getMarketLocationSolarSystemID(stationID) {
-  const structure = getStructureMarketLocation(stationID);
-  return normalizePositiveInteger(
-    getStationSolarSystemID(stationID) || structure && structure.solarSystemID,
-    0,
-  );
 }
 
 function ensureStructureMarketServiceAccess(session, stationID) {
@@ -3336,6 +3356,143 @@ function flushCharacterWalletSagaBoundary(context) {
   );
 }
 
+function flushMarketWalletSagaBoundary(isCorp, context) {
+  if (isWalletAuthorityProcessEnabled()) return;
+  requireDurableMarketSagaWrite(
+    database.flushTableSync(isCorp ? "corporationRuntime" : "characters"),
+    context,
+  );
+}
+
+function buildInitialOrderFees(amount, securityTaxAmount, payer, characterID, stationID, side) {
+  if (!(amount > 0)) return null;
+
+  // The first accepted fill owns the creation fee in full. Placement only
+  // owns that fee when the submission has no matches and rests as an order.
+  const marketOwnerID = getMarketCounterpartyOwnerID(stationID);
+  return {
+    amount,
+    securityTaxAmount,
+    payer,
+    characterID,
+    stationID,
+    side,
+    marketOwnerID: marketOwnerID || stationID,
+    structureOwnerCorpID: getStructureMarketLocation(stationID) ? marketOwnerID : 0,
+  };
+}
+
+function getInitialMarketSecurityTaxAmount(session, typeID, orderSystemID, duration, enteredValue) {
+  if (duration <= 0) return 0;
+  // A remote PLEX order uses a separate market with unverified tax jurisdiction.
+  if (typeID === PLEX_TYPE_ID &&
+      getNumericSessionValue(session, ["solarsystemid2", "solarsystemid"]) !== orderSystemID) {
+    return 0;
+  }
+  return computeExordiumMarketSecurityTax(orderSystemID, enteredValue);
+}
+
+function adjustMarketSecurityTax(fee, typeLabel, { refund = false, idempotencyKey } = {}) {
+  const adjustWallet = refund ? creditCharacterWallet : debitCharacterWallet;
+  return adjustWallet(
+    fee.payer.id,
+    fee.securityTaxAmount,
+    refund ? `Market safety tax refund for failed ${fee.side} order ${typeLabel}`
+      : `Market safety tax for ${fee.side} order ${typeLabel}`,
+    fee.stationID,
+    {
+      isCorp: fee.payer.isCorp,
+      accountKey: fee.payer.accountKey,
+      entryTypeID: JOURNAL_ENTRY_TYPE.MARKET_SECURITY_TAX,
+      ownerID1: CONCORD_CORPORATION_ID,
+      ownerID2: fee.characterID,
+      referenceID: fee.stationID,
+      idempotencyKey,
+    },
+  );
+}
+
+async function applyInitialOrderFees(saga, typeLabel, persist) {
+  const fee = saga.initialOrderBrokerFee;
+  if (fee.securityTaxAmount > 0 && !saga.initialOrderSecurityTaxDebited) {
+    await adjustMarketSecurityTax(fee, typeLabel, {
+      idempotencyKey: `${saga.operationKey}:wallet:initial-market-security-tax`,
+    });
+    saga.initialOrderSecurityTaxDebited = true;
+    flushMarketWalletSagaBoundary(fee.payer.isCorp, "Persisting market security tax");
+    persist();
+  }
+  if (saga.initialOrderBrokerFeeDebited) return;
+
+  await debitCharacterWallet(
+    fee.payer.id,
+    fee.amount,
+    `Broker fee for ${fee.side} order ${typeLabel}`,
+    fee.stationID,
+    {
+      isCorp: fee.payer.isCorp,
+      accountKey: fee.payer.accountKey,
+      entryTypeID: JOURNAL_ENTRY_TYPE.BROKERS_FEE,
+      ownerID1: fee.marketOwnerID,
+      ownerID2: fee.characterID,
+      referenceID: fee.stationID,
+      idempotencyKey: `${saga.operationKey}:wallet:initial-broker-fee`,
+    },
+  );
+  saga.initialOrderBrokerFeeDebited = true;
+  flushMarketWalletSagaBoundary(fee.payer.isCorp, "Persisting initial broker fee");
+  persist();
+}
+
+async function refundInitialOrderFees(saga, typeLabel) {
+  const fee = saga.initialOrderBrokerFee;
+  if (saga.initialOrderSecurityTaxDebited) {
+    await adjustMarketSecurityTax(fee, typeLabel, {
+      refund: true,
+      idempotencyKey: `${saga.operationKey}:wallet:initial-market-security-tax-refund`,
+    });
+    flushMarketWalletSagaBoundary(fee.payer.isCorp, "Persisting market security tax refund");
+  }
+  if (!saga.initialOrderBrokerFeeDebited) return;
+
+  await creditCharacterWallet(
+    fee.payer.id,
+    fee.amount,
+    `Broker fee refund for failed ${fee.side} order ${typeLabel}`,
+    fee.stationID,
+    {
+      isCorp: fee.payer.isCorp,
+      accountKey: fee.payer.accountKey,
+      entryTypeID: JOURNAL_ENTRY_TYPE.BROKERS_FEE,
+      ownerID1: fee.marketOwnerID,
+      ownerID2: fee.characterID,
+      referenceID: fee.stationID,
+      idempotencyKey: `${saga.operationKey}:wallet:initial-broker-fee-refund`,
+    },
+  );
+  flushMarketWalletSagaBoundary(fee.payer.isCorp, "Persisting initial broker fee refund");
+}
+
+async function creditInitialOrderBrokerFeeOwner(saga, typeLabel) {
+  const fee = saga.initialOrderBrokerFee;
+  if (!fee) return;
+
+  const result = await creditStructureMarketBrokerFeeOwner(
+    fee.characterID,
+    fee.stationID,
+    fee.amount,
+    `Structure broker fee for ${fee.side} order ${typeLabel}`,
+    {
+      ownerCorpID: fee.structureOwnerCorpID,
+      idempotencyKey: `${saga.operationKey}:wallet:initial-broker-fee-owner`,
+    },
+  );
+  if (result) {
+    requireDurableMarketSagaWrite(result, "Crediting initial broker fee to market owner");
+    flushMarketWalletSagaBoundary(true, "Persisting initial broker fee for market owner");
+  }
+}
+
 function allocateSeedMarketFillSagaIdentity(direction) {
   const allocation = allocateMarketSagaIDDurable();
   requireDurableMarketSagaWrite(
@@ -3482,6 +3639,8 @@ async function compensateSeedSellFillSaga(anchorRecord, saga, typeLabel) {
     persistSeedMarketFillSaga(anchorRecord, saga);
   }
 
+  if (saga.initialOrderBrokerFee) await refundInitialOrderFees(saga, typeLabel);
+
   requireDurableMarketSagaWrite(
     removeEscrowRecordDurable(saga.anchorOrderID),
     `Clearing compensated seeded market fill saga ${saga.operationKey}`,
@@ -3500,6 +3659,10 @@ async function executeSeedSellFillSagaUnlocked(
   }
 
   try {
+    if (saga.initialOrderBrokerFee) {
+      await applyInitialOrderFees(saga, typeLabel, () => persistSeedMarketFillSaga(anchorRecord, saga));
+    }
+
     const buyerWalletOptions = saga.buyerIsCorp
       ? { isCorp: true, accountKey: saga.buyerAccountKey }
       : {};
@@ -3600,6 +3763,8 @@ async function executeSeedSellFillSagaUnlocked(
       saga.delivered = true;
       persistSeedMarketFillSaga(anchorRecord, saga);
     }
+
+    if (saga.initialOrderBrokerFee) await creditInitialOrderBrokerFeeOwner(saga, typeLabel);
 
     requireDurableMarketSagaWrite(
       recordCompletedMarketFillAchievements(saga),
@@ -3823,7 +3988,7 @@ function buildSeedBuyFillSaga({
   };
 }
 
-function compensateSeedBuyFillSaga(anchorRecord, saga) {
+async function compensateSeedBuyFillSaga(anchorRecord, saga, typeLabel) {
   saga.status = "compensating";
   persistSeedMarketFillSaga(anchorRecord, saga);
   for (let index = saga.itemLegs.length - 1; index >= 0; index -= 1) {
@@ -3848,6 +4013,8 @@ function compensateSeedBuyFillSaga(anchorRecord, saga) {
     leg.released = true;
     persistSeedMarketFillSaga(anchorRecord, saga);
   }
+  if (saga.initialOrderBrokerFee) await refundInitialOrderFees(saga, typeLabel);
+
   requireDurableMarketSagaWrite(
     removeEscrowRecordDurable(saga.anchorOrderID),
     `Clearing compensated seeded market fill saga ${saga.operationKey}`,
@@ -3861,11 +4028,15 @@ async function executeSeedBuyFillSagaUnlocked(
   options = {},
 ) {
   if (saga.status === "compensating") {
-    compensateSeedBuyFillSaga(anchorRecord, saga);
+    await compensateSeedBuyFillSaga(anchorRecord, saga, typeLabel);
     return { compensated: true };
   }
 
   try {
+    if (saga.initialOrderBrokerFee) {
+      await applyInitialOrderFees(saga, typeLabel, () => persistSeedMarketFillSaga(anchorRecord, saga));
+    }
+
     for (const leg of saga.itemLegs) {
       if (leg.reserved) {
         continue;
@@ -3989,6 +4160,8 @@ async function executeSeedBuyFillSagaUnlocked(
       }
     }
 
+    if (saga.initialOrderBrokerFee) await creditInitialOrderBrokerFeeOwner(saga, typeLabel);
+
     requireDurableMarketSagaWrite(
       recordCompletedMarketFillAchievements(saga),
       `Recording market achievement contributions ${saga.operationKey}`,
@@ -4010,7 +4183,7 @@ async function executeSeedBuyFillSagaUnlocked(
     };
   } catch (error) {
     if (canCompensateRejectedPrimaryFill(saga, error)) {
-      compensateSeedBuyFillSaga(anchorRecord, saga);
+      await compensateSeedBuyFillSaga(anchorRecord, saga, typeLabel);
     } else if (options.scheduleRecovery !== false) {
       await queueDurableMarketFillRecovery(anchorRecord, saga, error);
     }
@@ -4343,6 +4516,8 @@ async function compensatePlayerSellFillSaga(escrowRecord, saga, typeLabel) {
     persistPlayerSellFillSaga(escrowRecord, saga);
   }
 
+  if (saga.initialOrderBrokerFee) await refundInitialOrderFees(saga, typeLabel);
+
   requireDurableMarketSagaWrite(
     putEscrowRecordDurable({
       ...escrowRecord,
@@ -4366,6 +4541,10 @@ async function executePlayerSellFillSagaUnlocked(
   }
 
   try {
+    if (saga.initialOrderBrokerFee) {
+      await applyInitialOrderFees(saga, typeLabel, () => persistPlayerSellFillSaga(escrowRecord, saga));
+    }
+
     const buyerWalletOptions = saga.buyerIsCorp
       ? { isCorp: true, accountKey: saga.buyerAccountKey }
       : {};
@@ -4520,6 +4699,8 @@ async function executePlayerSellFillSagaUnlocked(
       }
     }
 
+    if (saga.initialOrderBrokerFee) await creditInitialOrderBrokerFeeOwner(saga, typeLabel);
+
     requireDurableMarketSagaWrite(
       recordCompletedMarketFillAchievements(saga),
       `Recording market achievement contributions ${saga.operationKey}`,
@@ -4613,6 +4794,7 @@ async function matchSellOrdersForBuyer({
   currentStationID,
   currentSolarSystemID,
   chargeBuyerWallet = true,
+  initialOrderBrokerFee = null,
   crossingOrderID = null,
   crossingOrderPrice = 0,
   crossingOrderAvailableQuantity = 0,
@@ -4720,6 +4902,9 @@ async function matchSellOrdersForBuyer({
           crossingOrderPrice,
           crossingAvailableQuantity: crossingRemainingQuantity,
         });
+        if (totalBought === 0 && initialOrderBrokerFee) {
+          saga.initialOrderBrokerFee = initialOrderBrokerFee;
+        }
         const anchorRecord = {
           orderId: saga.anchorOrderID,
           escrowType: "seed-fill",
@@ -4809,6 +4994,9 @@ async function matchSellOrdersForBuyer({
           crossingOrderPrice,
           crossingAvailableQuantity: crossingRemainingQuantity,
         });
+        if (totalBought === 0 && initialOrderBrokerFee) {
+          saga.initialOrderBrokerFee = initialOrderBrokerFee;
+        }
         persistPlayerSellFillSaga(escrowRecord, saga);
         const sagaResult = await executePlayerSellFillSaga(
           escrowRecord,
@@ -5054,6 +5242,9 @@ function buildPlayerBuyFillSaga({
     availableQuantity,
     orderPrice,
     grossAmount,
+    priceImprovementRefund: Math.max(0, roundIsk(
+      computeOrderValue(buyOrder.price, fillableQuantity) - grossAmount,
+    )),
     salesTax,
     stationMarketOwnerID,
     sourceOrderID: normalizedSourceOrderID || null,
@@ -5148,6 +5339,8 @@ async function compensatePlayerBuyFillSaga(escrowRecord, saga, typeLabel) {
     persistPlayerBuyFillSaga(escrowRecord, saga);
   }
 
+  if (saga.initialOrderBrokerFee) await refundInitialOrderFees(saga, typeLabel);
+
   requireDurableMarketSagaWrite(
     putEscrowRecordDurable({
       ...escrowRecord,
@@ -5171,6 +5364,10 @@ async function executePlayerBuyFillSagaUnlocked(
   }
 
   try {
+    if (saga.initialOrderBrokerFee) {
+      await applyInitialOrderFees(saga, typeLabel, () => persistPlayerBuyFillSaga(escrowRecord, saga));
+    }
+
     const sellerWalletOptions = saga.sellerIsCorp
       ? { isCorp: true, accountKey: saga.sellerAccountKey }
       : {};
@@ -5279,6 +5476,32 @@ async function executePlayerBuyFillSagaUnlocked(
         }
       }
     }
+
+    // The bid funded the full bid price. Refund the difference only after the
+    // daemon accepts the fill, while the saga still owns the escrow record.
+    if (saga.priceImprovementRefund > 0) {
+      const buyerWalletID = escrowRecord.isCorp
+        ? escrowRecord.walletOwnerId
+        : saga.buyerCharacterID;
+      await creditCharacterWallet(
+        buyerWalletID,
+        saga.priceImprovementRefund,
+        `Market price improvement refund for ${typeLabel} order ${saga.orderID}`,
+        saga.destinationStationID,
+        {
+          isCorp: escrowRecord.isCorp,
+          accountKey: escrowRecord.accountKey,
+          entryTypeID: JOURNAL_ENTRY_TYPE.MARKET_ESCROW,
+          ownerID1: saga.stationMarketOwnerID || saga.destinationStationID,
+          ownerID2: buyerWalletID,
+          referenceID: saga.destinationStationID,
+          idempotencyKey: `${saga.operationKey}:wallet:price-improvement-refund`,
+        },
+      );
+      flushMarketWalletSagaBoundary(escrowRecord.isCorp, "Persisting market price improvement refund");
+    }
+
+    if (saga.initialOrderBrokerFee) await creditInitialOrderBrokerFeeOwner(saga, typeLabel);
 
     requireDurableMarketSagaWrite(
       recordCompletedMarketFillAchievements(saga),
@@ -5400,6 +5623,7 @@ async function matchBuyOrdersForSeller({
   sourceItemID,
   sourceOrderId,
   targetBuyOrderID = null,
+  initialOrderBrokerFee = null,
   crossingOrderID = null,
   crossingOrderAvailableQuantity = 0,
 } = {}) {
@@ -5507,6 +5731,11 @@ async function matchBuyOrdersForSeller({
     }
     if (!isSeedBuyOrder) {
       buyerEscrowRecord = getEscrowRecord(buyOrder && buyOrder.order_id);
+      // The owner lookup above awaited the daemon. Another sale may now own
+      // this escrow, even if the order was idle when the book was read.
+      if (buyerEscrowRecord?.pendingFill) {
+        continue;
+      }
       // Item delivery must go to the character who actually placed this buy
       // order (escrowRecord.ownerId, our own bookkeeping) - not
       // playerBuyOrder.owner_id, which is a corporation ID for a corp-wallet
@@ -5546,7 +5775,8 @@ async function matchBuyOrdersForSeller({
           info: `Market buy order ${normalizeOrderId(buyOrder && buyOrder.order_id)} is missing escrow state.`,
         });
       }
-      const grossAmount = roundIsk(orderPrice * fillableQuantity);
+      const executionPrice = roundIsk(minimumPrice);
+      const grossAmount = computeOrderValue(executionPrice, fillableQuantity);
       const stationMarketOwnerID = getMarketCounterpartyOwnerID(
         destinationStationID,
       );
@@ -5563,7 +5793,7 @@ async function matchBuyOrdersForSeller({
         typeID,
         fillableQuantity,
         availableQuantity,
-        orderPrice,
+        orderPrice: executionPrice,
         grossAmount,
         salesTax,
         stationMarketOwnerID,
@@ -5572,6 +5802,9 @@ async function matchBuyOrdersForSeller({
         crossingOrderID,
         crossingAvailableQuantity: crossingRemainingQuantity,
       });
+      if (totalSold === 0 && initialOrderBrokerFee) {
+        saga.initialOrderBrokerFee = initialOrderBrokerFee;
+      }
       persistPlayerBuyFillSaga(escrowRecord, saga);
       const sagaResult = await executePlayerBuyFillSaga(
         escrowRecord,
@@ -5594,7 +5827,7 @@ async function matchBuyOrdersForSeller({
       // and the server checks that lesson against the seller's market transactions).
       try {
         try {
-          await recordTrade(typeID, orderPrice, fillableQuantity);
+          await recordTrade(typeID, executionPrice, fillableQuantity);
         } catch (error) {
           log.warn(
             `[MarketProxy] Failed to record committed fill ${saga.operationKey}: ${error.message}`,
@@ -5606,7 +5839,7 @@ async function matchBuyOrdersForSeller({
             : null,
           typeID,
           quantity: fillableQuantity,
-          price: orderPrice,
+          price: executionPrice,
           stationID: destinationStationID,
           buyerID: buyerOwner.isCorp ? buyerOwner.id : buyerCharacterID,
           sellerID: sellerWalletID,
@@ -5619,7 +5852,7 @@ async function matchBuyOrdersForSeller({
         await recordMarketTransactionForWalletOwner(buyerOwner, {
           typeID,
           quantity: fillableQuantity,
-          price: orderPrice,
+          price: executionPrice,
           stationID: destinationStationID,
           buyerID: buyerOwner.isCorp ? buyerOwner.id : buyerCharacterID,
           sellerID: sellerWalletID,
@@ -5679,6 +5912,9 @@ async function matchBuyOrdersForSeller({
       crossingOrderID,
       crossingAvailableQuantity: crossingRemainingQuantity,
     });
+    if (totalSold === 0 && initialOrderBrokerFee) {
+      saga.initialOrderBrokerFee = initialOrderBrokerFee;
+    }
     const anchorRecord = {
       orderId: saga.anchorOrderID,
       escrowType: "seed-fill",
@@ -5771,23 +6007,25 @@ async function executeBuyRequest({
     : {};
   const payerWalletID = payer.isCorp ? payer.id : characterID;
   const normalizedQuantity = normalizePositiveInteger(requestedQuantity, 0);
-  const normalizedPrice = roundIsk(maxPrice);
+  const requestedPrice = roundIsk(maxPrice);
   const normalizedDuration = normalizeInteger(durationDays, 0);
   const normalizedMinVolume = Math.max(
     1,
     normalizePositiveInteger(minVolume, 1),
   );
   const typeLabel = getMarketTypeLabel(typeID);
-  ensureValidPrice(normalizedPrice);
+  ensureValidPrice(requestedPrice);
   ensureValidDuration(normalizedDuration);
+  const normalizedPrice = normalizedDuration > 0
+    ? getValidatedStandingOrderPrice(requestedPrice, true)
+    : requestedPrice;
   ensureValidMinVolume(normalizedQuantity, normalizedMinVolume);
   ensureStructureMarketServiceAccess(session, stationID);
   const marketContext = buildCharacterMarketContext(session, characterID, stationID);
 
   if (normalizedDuration > 0) {
     validateExpectedBrokerFeePercentage(expectedBrokerFee, marketContext);
-    ensureValidBuyRange(orderRange, marketContext.limits);
-    ensureRemoteBuyOrderPlacementAllowed(session, stationID, marketContext);
+    ensureStandingBuyOrderPlacementAllowed(session, stationID, orderRange, marketContext);
   }
 
   const openOrders = normalizedDuration > 0
@@ -5802,7 +6040,11 @@ async function executeBuyRequest({
   }
 
   const reserveUpperBound = roundIsk(normalizedPrice * normalizedQuantity);
-  const brokerFeeUpperBound = normalizedDuration > 0
+  const orderSystemID = getMarketLocationSolarSystemID(stationID);
+  const securityTaxAmount = getInitialMarketSecurityTaxAmount(
+    session, typeID, orderSystemID, normalizedDuration, reserveUpperBound,
+  );
+  const initialBrokerFeeAmount = normalizedDuration > 0
     ? computeBrokerFeeInfo(marketContext, null, reserveUpperBound).amount
     : 0;
   const sccSurchargeUpperBound = normalizedDuration > 0
@@ -5811,11 +6053,14 @@ async function executeBuyRequest({
 
   ensureCharacterHasFunds(
     payerWalletID,
-    reserveUpperBound + brokerFeeUpperBound + sccSurchargeUpperBound,
+    reserveUpperBound + initialBrokerFeeAmount + sccSurchargeUpperBound + securityTaxAmount,
     `Placing a buy order for ${typeLabel}`,
     payerWalletOptions,
   );
 
+  const initialOrderFees = buildInitialOrderFees(
+    initialBrokerFeeAmount, securityTaxAmount, payer, characterID, stationID, "buy",
+  );
   const matchResult = await matchSellOrdersForBuyer({
     session,
     buyerCharacterID: characterID,
@@ -5826,17 +6071,14 @@ async function executeBuyRequest({
     requestedQuantity: normalizedQuantity,
     orderRange: normalizeInteger(orderRange, RANGE_STATION),
     currentStationID: stationID,
-    currentSolarSystemID: getMarketLocationSolarSystemID(stationID),
+    currentSolarSystemID: orderSystemID,
+    initialOrderBrokerFee: initialOrderFees,
   });
 
   let createdOrder = null;
   if (normalizedDuration > 0 && matchResult.remainingQuantity > 0) {
     const remainingReserve = roundIsk(normalizedPrice * matchResult.remainingQuantity);
-    const brokerFeeInfo = computeBrokerFeeInfo(
-      marketContext,
-      null,
-      remainingReserve,
-    );
+    const brokerFeeAmount = matchResult.boughtQuantity === 0 ? initialBrokerFeeAmount : 0;
     const sccSurchargeInfo = computeSccSurchargeInfo(
       marketContext,
       null,
@@ -5858,7 +6100,7 @@ async function executeBuyRequest({
     );
     await debitCharacterWallet(
       payerWalletID,
-      brokerFeeInfo.amount,
+      brokerFeeAmount,
       `Broker fee for buy order ${typeLabel}`,
       stationID,
       {
@@ -5883,7 +6125,13 @@ async function executeBuyRequest({
       },
     );
 
+    let securityTaxDebited = false;
     try {
+      if (matchResult.boughtQuantity === 0 && securityTaxAmount > 0) {
+        await adjustMarketSecurityTax(initialOrderFees, typeLabel);
+        securityTaxDebited = true;
+        flushMarketWalletSagaBoundary(payer.isCorp, "Persisting market security tax for buy order");
+      }
       const placedOrder = await marketDaemonClient.call("PlaceOrder", {
         owner_id: payerWalletID,
         is_corp: payer.isCorp,
@@ -5934,11 +6182,15 @@ async function executeBuyRequest({
       await creditStructureMarketBrokerFeeOwner(
         characterID,
         stationID,
-        brokerFeeInfo.amount,
+        brokerFeeAmount,
         `Structure broker fee for buy order ${typeLabel}`,
       );
       notifyOwnOrdersChanged(characterID, [createdOrder], ORDER_REASON_CREATED, payer.isCorp);
     } catch (error) {
+      if (!createdOrder && securityTaxDebited && error?.marketDaemonOutcomeUnknown === true) {
+        // The daemon may have accepted the taxed order. Keep its funds reserved.
+        throw error;
+      }
       if (createdOrder) {
         await marketDaemonClient.call("CancelOrder", {
           order_id: normalizeOrderId(createdOrder.order_id),
@@ -5961,7 +6213,7 @@ async function executeBuyRequest({
       );
       await creditCharacterWallet(
         payerWalletID,
-        brokerFeeInfo.amount,
+        brokerFeeAmount,
         `Broker fee refund for failed buy order ${typeLabel}`,
         stationID,
         {
@@ -5985,6 +6237,10 @@ async function executeBuyRequest({
           referenceID: stationID,
         },
       );
+      if (securityTaxDebited) {
+        await adjustMarketSecurityTax(initialOrderFees, typeLabel, { refund: true });
+        flushMarketWalletSagaBoundary(payer.isCorp, "Persisting market security tax refund for buy order");
+      }
       throw error;
     }
     try {
@@ -6045,7 +6301,7 @@ async function executeSellEntryUnlocked({
   const typeID = normalizePositiveInteger(entry && entry.typeID, 0);
   const typeLabel = getMarketTypeLabel(typeID);
   const stationID = normalizePositiveInteger(entry && entry.stationID, 0);
-  const price = roundIsk(entry && entry.price);
+  const requestedPrice = roundIsk(entry && entry.price);
   const requestedQuantity = normalizePositiveInteger(entry && entry.quantity, 0);
   const itemID = normalizePositiveInteger(entry && entry.itemID, 0);
   const item = findItemById(itemID);
@@ -6101,8 +6357,11 @@ async function executeSellEntryUnlocked({
   }
 
   const normalizedDuration = normalizeInteger(durationDays, 0);
-  ensureValidPrice(price);
+  ensureValidPrice(requestedPrice);
   ensureValidDuration(normalizedDuration);
+  const price = normalizedDuration > 0
+    ? getValidatedStandingOrderPrice(requestedPrice, false)
+    : requestedPrice;
   ensureStructureMarketServiceAccess(session, stationID);
   const marketContext = buildCharacterMarketContext(session, characterID, stationID);
   if (normalizedDuration > 0) {
@@ -6119,79 +6378,94 @@ async function executeSellEntryUnlocked({
     ]);
   }
 
+  const enteredValue = computeOrderValue(price, requestedQuantity);
+  const orderSystemID = getMarketLocationSolarSystemID(stationID);
+  // Playerbot sell listings are an explicit economy feature: creating an
+  // order is free for server-owned actors, while market transaction tax is
+  // still charged when a buyer actually fills it. Human orders keep the
+  // normal broker fee, SCC surcharge and market safety tax.
+  const waivePlayerbotListingFees = Boolean(session && session._playerBotActor === true &&
+    session.sessionType === "playerbot-actor");
+  const securityTaxAmount = waivePlayerbotListingFees ? 0 : getInitialMarketSecurityTaxAmount(
+    session, typeID, orderSystemID, normalizedDuration, enteredValue,
+  );
+  const initialBrokerFeeAmount = normalizedDuration > 0 && !waivePlayerbotListingFees
+    ? computeBrokerFeeInfo(marketContext, null, enteredValue).amount
+    : 0;
+  const initialOrderFees = buildInitialOrderFees(
+    initialBrokerFeeAmount, securityTaxAmount, payer, characterID, stationID, "sell",
+  );
+  if (securityTaxAmount > 0) {
+    ensureCharacterHasFunds(
+      payerWalletID, initialBrokerFeeAmount + securityTaxAmount,
+      `Placing a sell order for ${typeLabel}`, payerWalletOptions,
+    );
+  }
   const sellResult = await matchBuyOrdersForSeller({
     session,
     sellerCharacterID: characterID,
     sellerOwner: payer,
     regionID,
     stationID,
-    solarSystemID: getMarketLocationSolarSystemID(stationID),
+    solarSystemID: orderSystemID,
     typeID,
     minimumPrice: price,
     requestedQuantity,
     sourceItemID: itemID,
     targetBuyOrderID: entry && entry.targetOrderID,
+    initialOrderBrokerFee: initialOrderFees,
   });
 
   let createdOrder = null;
   if (normalizedDuration > 0 && sellResult.remainingQuantity > 0) {
     const openOrderValue = computeOrderValue(price, sellResult.remainingQuantity);
-    const calculatedBrokerFee = computeBrokerFeeInfo(
-      marketContext,
-      null,
-      openOrderValue,
-    );
+    const brokerFeeAmount = sellResult.soldQuantity === 0 ? initialBrokerFeeAmount : 0;
     const calculatedSccSurcharge = computeSccSurchargeInfo(
       marketContext,
       null,
       openOrderValue,
     );
-    // Playerbot sell listings are an explicit economy feature: creating an
-    // order is free for server-owned actors, while market transaction tax is
-    // still charged when a buyer actually fills it. Human orders keep normal
-    // broker and SCC fees.
-    const waivePlayerbotListingFees = session && session._playerBotActor === true &&
-      session.sessionType === "playerbot-actor";
-    const brokerFeeInfo = waivePlayerbotListingFees
-      ? { ...calculatedBrokerFee, amount: 0 }
-      : calculatedBrokerFee;
     const sccSurchargeInfo = waivePlayerbotListingFees
       ? { ...calculatedSccSurcharge, amount: 0 }
       : calculatedSccSurcharge;
     const stationMarketOwnerID = getMarketCounterpartyOwnerID(stationID);
-    if (brokerFeeInfo.amount > 0) {
-      await debitCharacterWallet(
-        payerWalletID,
-        brokerFeeInfo.amount,
-        `Broker fee for sell order ${typeLabel}`,
-        stationID,
-        {
-          ...payerWalletOptions,
-          entryTypeID: JOURNAL_ENTRY_TYPE.BROKERS_FEE,
-          ownerID1: stationMarketOwnerID || stationID,
-          ownerID2: characterID,
-          referenceID: stationID,
-        },
-      );
-    }
-    if (sccSurchargeInfo.amount > 0) {
-      await debitCharacterWallet(
-        payerWalletID,
-        sccSurchargeInfo.amount,
-        `SCC surcharge for sell order ${typeLabel}`,
-        stationID,
-        {
-          ...payerWalletOptions,
-          entryTypeID: JOURNAL_ENTRY_TYPE.MARKET_PROVIDER_TAX,
-          ownerID1: stationMarketOwnerID || stationID,
-          ownerID2: characterID,
-          referenceID: stationID,
-        },
-      );
-    }
+    await debitCharacterWallet(
+      payerWalletID,
+      brokerFeeAmount,
+      `Broker fee for sell order ${typeLabel}`,
+      stationID,
+      {
+        ...payerWalletOptions,
+        entryTypeID: JOURNAL_ENTRY_TYPE.BROKERS_FEE,
+        ownerID1: stationMarketOwnerID || stationID,
+        ownerID2: characterID,
+        referenceID: stationID,
+      },
+    );
+    await debitCharacterWallet(
+      payerWalletID,
+      sccSurchargeInfo.amount,
+      `SCC surcharge for sell order ${typeLabel}`,
+      stationID,
+      {
+        ...payerWalletOptions,
+        entryTypeID: JOURNAL_ENTRY_TYPE.MARKET_PROVIDER_TAX,
+        ownerID1: stationMarketOwnerID || stationID,
+        ownerID2: characterID,
+        referenceID: stationID,
+      },
+    );
 
     let placedOrder = null;
+    let securityTaxDebited = false;
+    let placementAttempted = false;
     try {
+      if (sellResult.soldQuantity === 0 && securityTaxAmount > 0) {
+        await adjustMarketSecurityTax(initialOrderFees, typeLabel);
+        securityTaxDebited = true;
+        flushMarketWalletSagaBoundary(payer.isCorp, "Persisting market security tax for sell order");
+      }
+      placementAttempted = true;
       placedOrder = await marketDaemonClient.call("PlaceOrder", {
         owner_id: payerWalletID,
         is_corp: payer.isCorp,
@@ -6207,43 +6481,45 @@ async function executeSellEntryUnlocked({
         source: "player",
       });
     } catch (error) {
-      // Nothing has reached escrow yet, so there is no order to cancel, no
-      // record to drop and no stack to return. Refund any fees already charged
-      // for a human listing. A request left unanswered may have placed the
-      // order, so nothing is refunded while its outcome is unknown.
+      // No remainder has reached escrow yet, so there is no order to cancel,
+      // record to drop or stack to return. Refund the charges this placement
+      // took if the daemon refused the remainder order or was never sent
+      // it. A request it left unanswered may have placed the order, so, as the
+      // fills do (canCompensateRejectedPrimaryFill), nothing is given back for
+      // an outcome that is not known.
       if (
-        isDefinitiveMarketDaemonRejection(error) ||
+        !placementAttempted || isDefinitiveMarketDaemonRejection(error) ||
         error && error.marketDaemonRequestSent === false
       ) {
-        if (brokerFeeInfo.amount > 0) {
-          await creditCharacterWallet(
-            payerWalletID,
-            brokerFeeInfo.amount,
-            `Broker fee refund for failed sell order ${typeLabel}`,
-            stationID,
-            {
-              ...payerWalletOptions,
-              entryTypeID: JOURNAL_ENTRY_TYPE.BROKERS_FEE,
-              ownerID1: stationMarketOwnerID || stationID,
-              ownerID2: characterID,
-              referenceID: stationID,
-            },
-          );
-        }
-        if (sccSurchargeInfo.amount > 0) {
-          await creditCharacterWallet(
-            payerWalletID,
-            sccSurchargeInfo.amount,
-            `SCC surcharge refund for failed sell order ${typeLabel}`,
-            stationID,
-            {
-              ...payerWalletOptions,
-              entryTypeID: JOURNAL_ENTRY_TYPE.MARKET_PROVIDER_TAX,
-              ownerID1: stationMarketOwnerID || stationID,
-              ownerID2: characterID,
-              referenceID: stationID,
-            },
-          );
+        await creditCharacterWallet(
+          payerWalletID,
+          brokerFeeAmount,
+          `Broker fee refund for failed sell order ${typeLabel}`,
+          stationID,
+          {
+            ...payerWalletOptions,
+            entryTypeID: JOURNAL_ENTRY_TYPE.BROKERS_FEE,
+            ownerID1: stationMarketOwnerID || stationID,
+            ownerID2: characterID,
+            referenceID: stationID,
+          },
+        );
+        await creditCharacterWallet(
+          payerWalletID,
+          sccSurchargeInfo.amount,
+          `SCC surcharge refund for failed sell order ${typeLabel}`,
+          stationID,
+          {
+            ...payerWalletOptions,
+            entryTypeID: JOURNAL_ENTRY_TYPE.MARKET_PROVIDER_TAX,
+            ownerID1: stationMarketOwnerID || stationID,
+            ownerID2: characterID,
+            referenceID: stationID,
+          },
+        );
+        if (securityTaxDebited) {
+          await adjustMarketSecurityTax(initialOrderFees, typeLabel, { refund: true });
+          flushMarketWalletSagaBoundary(payer.isCorp, "Persisting market security tax refund for sell order");
         }
       }
       throw error;
@@ -6336,7 +6612,7 @@ async function executeSellEntryUnlocked({
       await creditStructureMarketBrokerFeeOwner(
         characterID,
         stationID,
-        brokerFeeInfo.amount,
+        brokerFeeAmount,
         `Structure broker fee for sell order ${typeLabel}`,
       );
 
@@ -6392,35 +6668,35 @@ async function executeSellEntryUnlocked({
           reason: itemCustody.CUSTODY_REASON.MARKET_ESCROW_RETURN,
         });
       }
-      if (brokerFeeInfo.amount > 0) {
-        await creditCharacterWallet(
-          payerWalletID,
-          brokerFeeInfo.amount,
-          `Broker fee refund for failed sell order ${typeLabel}`,
-          stationID,
-          {
-            ...payerWalletOptions,
-            entryTypeID: JOURNAL_ENTRY_TYPE.BROKERS_FEE,
-            ownerID1: stationMarketOwnerID || stationID,
-            ownerID2: characterID,
-            referenceID: stationID,
-          },
-        );
-      }
-      if (sccSurchargeInfo.amount > 0) {
-        await creditCharacterWallet(
-          payerWalletID,
-          sccSurchargeInfo.amount,
-          `SCC surcharge refund for failed sell order ${typeLabel}`,
-          stationID,
-          {
-            ...payerWalletOptions,
-            entryTypeID: JOURNAL_ENTRY_TYPE.MARKET_PROVIDER_TAX,
-            ownerID1: stationMarketOwnerID || stationID,
-            ownerID2: characterID,
-            referenceID: stationID,
-          },
-        );
+      await creditCharacterWallet(
+        payerWalletID,
+        brokerFeeAmount,
+        `Broker fee refund for failed sell order ${typeLabel}`,
+        stationID,
+        {
+          ...payerWalletOptions,
+          entryTypeID: JOURNAL_ENTRY_TYPE.BROKERS_FEE,
+          ownerID1: stationMarketOwnerID || stationID,
+          ownerID2: characterID,
+          referenceID: stationID,
+        },
+      );
+      await creditCharacterWallet(
+        payerWalletID,
+        sccSurchargeInfo.amount,
+        `SCC surcharge refund for failed sell order ${typeLabel}`,
+        stationID,
+        {
+          ...payerWalletOptions,
+          entryTypeID: JOURNAL_ENTRY_TYPE.MARKET_PROVIDER_TAX,
+          ownerID1: stationMarketOwnerID || stationID,
+          ownerID2: characterID,
+          referenceID: stationID,
+        },
+      );
+      if (securityTaxDebited) {
+        await adjustMarketSecurityTax(initialOrderFees, typeLabel, { refund: true });
+        flushMarketWalletSagaBoundary(payer.isCorp, "Persisting market security tax refund for sell order");
       }
       throw error;
     }
@@ -7024,7 +7300,7 @@ class MarketProxyService extends BaseService {
 
   Handle_CharGetTransactions(args, session) {
     const characterID = getNumericSessionValue(session, ["charid", "characterID"]);
-    const fromDate = args && args.length > 0 ? args[0] : null;
+    const fromDate = args?.[0] ?? (currentFileTime() - MARKET_TRANSACTION_DEFAULT_WINDOW);
     log.debug(
       `[MarketProxy] CharGetTransactions char=${characterID} fromDate=${normalizeBigInt(fromDate, 0n).toString()}`,
     );
@@ -7119,17 +7395,19 @@ class MarketProxyService extends BaseService {
           (total, record) => total + roundIsk(record && record.escrowAmount),
           0,
         );
+      const averagePrices = getAverageMarketPrices();
       const itemsEscrow = escrowRecords
         .filter((record) => getEscrowType(record) === "sell")
-        .reduce(
-          (total, record) =>
-            total + normalizePositiveInteger(record && record.remainingQuantity, 0),
-          0,
-        );
+        .reduce((total, record) => {
+          const typeID = normalizePositiveInteger(record.typeId, 0);
+          const quantity = normalizePositiveInteger(record.remainingQuantity, 0);
+          const estimate = averagePrices.get(typeID)?.averagePrice ?? 0;
+          return total + quantity * estimate;
+        }, 0);
 
       return buildKeyVal([
         ["iskEscrow", roundIsk(iskEscrow)],
-        ["itemsEscrow", itemsEscrow],
+        ["itemsEscrow", roundIsk(itemsEscrow)],
       ]);
     } catch (error) {
       throwMarketUnavailable("GetCharEscrow", error);
@@ -7504,11 +7782,11 @@ class MarketProxyService extends BaseService {
 
   async Handle_ModifyCharOrder(args, session) {
     const orderID = normalizeOrderId(args && args[0]);
-    const newPrice = roundIsk(args && args[1]);
+    const requestedPrice = roundIsk(args && args[1]);
 
-    log.debug(`[MarketProxy] ModifyCharOrder order=${orderID} price=${newPrice}`);
+    log.debug(`[MarketProxy] ModifyCharOrder order=${orderID} price=${requestedPrice}`);
 
-    ensureValidPrice(newPrice);
+    ensureValidPrice(requestedPrice);
 
     try {
       await processPendingExpiryEvents({ forceSweep: true });
@@ -7542,6 +7820,8 @@ class MarketProxyService extends BaseService {
       ensureStructureMarketServiceAccess(session, stationID);
       const marketContext = buildCharacterMarketContext(session, ownerID, stationID);
       ensureRemoteOrderModificationAllowed(session, stationID, marketContext);
+      const isBuyOrder = normalizeBoolean(orderRow && orderRow.bid);
+      const newPrice = getValidatedStandingOrderPrice(requestedPrice, isBuyOrder);
       if (!(remainingVolume > 0) || Math.abs(newPrice - oldPrice) < 0.0001) {
         return null;
       }
@@ -7558,7 +7838,7 @@ class MarketProxyService extends BaseService {
         oldOrderValue,
         newOrderValue,
       );
-      const reserveDelta = normalizeBoolean(orderRow && orderRow.bid)
+      const reserveDelta = isBuyOrder
         ? roundIsk(newOrderValue - oldOrderValue)
         : 0;
       const stationMarketOwnerID = getMarketCounterpartyOwnerID(stationID);
@@ -7621,7 +7901,7 @@ class MarketProxyService extends BaseService {
           remainingVolume,
         );
 
-        if (normalizeBoolean(orderRow && orderRow.bid)) {
+        if (isBuyOrder) {
           const fillResponse = await applyBuyOrderCrossingAfterModify(session, order, newPrice);
           finalState = String(fillResponse && fillResponse.state ? fillResponse.state : finalState);
           finalRemainingVolume = normalizePositiveInteger(
@@ -7694,7 +7974,7 @@ class MarketProxyService extends BaseService {
         `Structure broker fee for modified ${typeLabel} order ${orderID}`,
       );
 
-      if (normalizeBoolean(orderRow && orderRow.bid)) {
+      if (isBuyOrder) {
         if (finalState === "filled") {
           removeEscrowRecord(orderID);
         } else {

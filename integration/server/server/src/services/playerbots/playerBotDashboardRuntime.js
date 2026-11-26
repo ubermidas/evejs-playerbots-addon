@@ -1,8 +1,13 @@
 "use strict";
 
-// The dashboard is an operator view, not part of a bot's decision loop. A
-// longer cache keeps reads bounded as the persistent roster grows.
-const CACHE_MS = 30_000;
+// The dashboard is an operator view, not part of a bot's decision loop. The
+// snapshot is reused for at least MIN_CACHE_MS so a page refresh shows live
+// numbers, and for longer when building it is expensive: a snapshot that took
+// T ms is kept for CACHE_COST_FACTOR * T, up to MAX_CACHE_MS, so the dashboard
+// never spends more than about 1/CACHE_COST_FACTOR of the game loop on itself.
+const MIN_CACHE_MS = 5_000;
+const MAX_CACHE_MS = 30_000;
+const CACHE_COST_FACTOR = 20;
 const MAX_PAGE_SIZE = 100;
 const DEFAULT_PAGE_SIZE = 50;
 const REQUESTED_TOTAL_BOTS = 15_000;
@@ -48,6 +53,7 @@ function createPlayerBotDashboardRuntime(options = {}) {
 
   let snapshot = null;
   let snapshotAtMs = 0;
+  let snapshotMaxAgeMs = MIN_CACHE_MS;
   let roster = [];
   let operationByCharacter = new Map();
   let activeWorkByCharacter = new Map();
@@ -388,7 +394,8 @@ function createPlayerBotDashboardRuntime(options = {}) {
 
   function refresh() {
     const now = Date.now();
-    if (snapshot && now - snapshotAtMs < CACHE_MS) return snapshot;
+    if (snapshot && now - snapshotAtMs < snapshotMaxAgeMs) return snapshot;
+    const buildStartedAt = process.hrtime.bigint();
     structureNames = new Map();
     allianceNames = new Map();
 
@@ -924,7 +931,10 @@ function createPlayerBotDashboardRuntime(options = {}) {
         botsWithQueuedOrLeasedTasks: Object.keys(taskSummary.byCharacter || {}).length,
       },
     };
+    const buildMs = Number(process.hrtime.bigint() - buildStartedAt) / 1e6;
     snapshotAtMs = now;
+    snapshotMaxAgeMs = Math.max(MIN_CACHE_MS, Math.min(MAX_CACHE_MS, Math.ceil(buildMs * CACHE_COST_FACTOR)));
+    snapshot.cache = { buildMs: Math.round(buildMs * 10) / 10, maxAgeMs: snapshotMaxAgeMs };
     return snapshot;
   }
 

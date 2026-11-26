@@ -99,8 +99,11 @@ function directorHtml(summary) {
 
 // One draw at a time; a filter click during a refresh runs right after it.
 const draw = coalesce(async (reloadRoster) => {
-  const summary = await ctxRef.loadSummary(false);
-  const [nextActivity] = await Promise.all([getJSON("/api/activity"), reloadRoster ? loadRoster(roster) : null]);
+  // The summary, the activity breakdown and the pilot list are independent
+  // reads; asking for them together saves a full round trip per draw.
+  const [summary, nextActivity] = await Promise.all([
+    ctxRef.loadSummary(false), getJSON("/api/activity"), reloadRoster ? loadRoster(roster) : null,
+  ]);
   activity = nextActivity;
   if (!$("act-roster")) return;
   $("act-head").innerHTML = headerHtml(summary) + statsHtml(summary, ctxRef.store.trend) + noticesHtml(summary);

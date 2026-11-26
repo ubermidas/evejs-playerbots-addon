@@ -1340,6 +1340,9 @@ function sendMail(options = {}) {
     if (!flushed?.success) return flushed || { success: false, errorMsg: "CAREER_MAIL_FLUSH_FAILED" };
     try { require("../career/careerProgress").sync(senderID); }
     catch (_error) { /* GetAll re-reads the durable mail marker after recovery. */ }
+    // Send an EVE Mail: a mail from a player's client to another capsuleer, receipted by its message id.
+    try { require("../achievement/achievementRuntime").recordMailSent(senderID, messageID); }
+    catch (_error) { /* achievement bookkeeping is best effort */ }
   }
 
   for (const characterID of recipientCharacterIDs) {

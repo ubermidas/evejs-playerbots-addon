@@ -103,27 +103,48 @@ function uptimeText(seconds) {
   return `${Math.floor(s / 60)}m`;
 }
 
-export async function loadSummary(force = false) {
-  if (!force && store.summary && Date.now() - store.summaryAt < refreshMs() - 500) return store.summary;
-  try {
-    const [summary, logos] = await Promise.all([
-      getJSON("/api/summary"),
-      // Servers from before corporation logos answer 404; the pages then show none.
-      getJSON("/api/corporation-logos").catch(() => null),
-    ]);
-    store.summary = summary;
-    if (logos) setCorporationLogos(logos);
-    store.summaryAt = Date.now();
-    recordTrend(summary);
-    setConnection(true, "Connected to EveJS", `Server up ${uptimeText(summary.process?.uptimeSeconds)}`);
-    $("updated-at").textContent = `Updated ${new Date(summary.generatedAt).toLocaleTimeString()}`;
-    void renderRail(railContext());
-  } catch (error) {
-    setConnection(false, "EveJS unreachable", "Retrying…");
-    $("updated-at").textContent = `Last try failed: ${error.message}`;
-    if (!store.summary) throw error;
-  }
-  return store.summary;
+// Corporation logos change only when someone uploads one (which reloads them
+// itself), so the list is read once and then every few minutes.
+const LOGOS_MS = 5 * 60 * 1000;
+let logosAt = 0;
+let summaryRequest = null;
+
+// The page, its view and the watch panel all ask for the summary; callers in
+// the same moment share one request.
+export function loadSummary(force = false) {
+  if (!force && store.summary && Date.now() - store.summaryAt < refreshMs() - 500) return Promise.resolve(store.summary);
+  if (summaryRequest) return summaryRequest;
+  // Timed from when the request starts, so a slow answer does not make the
+  // next refresh skip the summary and show numbers twice as old.
+  const startedAt = Date.now();
+  summaryRequest = (async () => {
+    try {
+      const wantLogos = Date.now() - logosAt >= LOGOS_MS;
+      const [summary, logos] = await Promise.all([
+        getJSON("/api/summary"),
+        // Servers from before corporation logos answer 404; the pages then show none.
+        wantLogos ? getJSON("/api/corporation-logos").catch(() => null) : null,
+      ]);
+      store.summary = summary;
+      if (logos) { setCorporationLogos(logos); logosAt = Date.now(); }
+      store.summaryAt = startedAt;
+      recordTrend(summary);
+      setConnection(true, "Connected to EveJS", `Server up ${uptimeText(summary.process?.uptimeSeconds)}`);
+      $("updated-at").textContent = `Updated ${new Date(summary.generatedAt).toLocaleTimeString()}`;
+      void renderRail(railContext());
+    } catch (error) {
+      const busy = error.status === 503;
+      setConnection(false, busy ? "EveJS is busy" : "EveJS unreachable", busy ? "Showing the last data" : "Retrying…");
+      $("updated-at").textContent = store.summary
+        ? `Last update ${new Date(store.summary.generatedAt).toLocaleTimeString()}; ${error.message}`
+        : `Last try failed: ${error.message}`;
+      if (!store.summary) throw error;
+    } finally {
+      summaryRequest = null;
+    }
+    return store.summary;
+  })();
+  return summaryRequest;
 }
 
 function railContext() {
@@ -217,23 +238,35 @@ async function refreshNow() {
 
 // ----------------------------------------------------------- live updates
 
+// One refresh at a time: the next starts a full interval after the last one
+// finished. A timer that fired regardless stacked requests whenever EveJS
+// answered slower than the interval, until the browser's six connections to
+// the dashboard were all waiting and every page stopped loading.
 let timer = null;
+let refreshing = null;
+
+async function tick() {
+  timer = null;
+  if (prefs().refreshPaused) return;
+  // Hidden tabs do not poll; the page refreshes when it is shown again.
+  if (document.hidden) return;
+  // Views re-render on the timer unless the operator is typing or reading a dialog.
+  const active = document.activeElement;
+  const editing = active && ["INPUT", "SELECT", "TEXTAREA"].includes(active.tagName) && $("view").contains(active);
+  if (!editing && !$("dialog").open && !paletteOpen() && !refreshing) {
+    const view = VIEWS[store.route.view];
+    refreshing = (view.autoRefresh === false ? loadSummary(false).catch(() => {}) : show(false))
+      .finally(() => { refreshing = null; });
+    await refreshing;
+  }
+  scheduleRefresh();
+}
 
 function scheduleRefresh() {
-  clearInterval(timer);
+  clearTimeout(timer);
+  timer = null;
   if (prefs().refreshPaused) return;
-  timer = setInterval(() => {
-    // Views re-render on the timer unless the operator is typing or reading a dialog.
-    const active = document.activeElement;
-    const editing = active && ["INPUT", "SELECT", "TEXTAREA"].includes(active.tagName) && $("view").contains(active);
-    if (editing || $("dialog").open || paletteOpen()) return;
-    const view = VIEWS[store.route.view];
-    if (view.autoRefresh === false) {
-      void loadSummary(false).catch(() => {});
-      return;
-    }
-    void show(false);
-  }, refreshMs());
+  timer = setTimeout(tick, refreshMs());
 }
 
 function drawLiveControl() {
@@ -411,6 +444,11 @@ function start() {
   let resizeTimer = null;
   window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => void renderRail(railContext()), 250); });
   document.addEventListener("keydown", onKey);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden || prefs().refreshPaused) return;
+    if (Date.now() - store.summaryAt >= refreshMs()) { clearTimeout(timer); void tick(); }
+    else if (!timer) scheduleRefresh();
+  });
   document.addEventListener("playerbots:notify", drawNotificationBadge);
   document.addEventListener("playerbots:open-palette", () => openPalette(paletteContext()));
   document.addEventListener("playerbots:shortcuts", showShortcuts);

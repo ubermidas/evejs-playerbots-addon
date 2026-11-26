@@ -8,6 +8,8 @@ const ERROR_TEXT = {
   PLAYERBOTS_ADDON_ROUTE_NOT_FOUND: "The EveJS server does not offer this dashboard feature yet. Rebuild and restart the server so it runs this version of the add-on's integration files.",
   PLAYERBOTS_ADDON_UNAUTHORIZED: "EveJS refused the dashboard's API token. Check that the server and the add-on use the same EVEJS_PLAYER_BOTS_ADDON_TOKEN.",
   PLAYERBOTS_ADDON_API_ERROR: "EveJS reported an internal error. Check the server log.",
+  PLAYERBOTS_DASHBOARD_BUSY: "EveJS did not answer within 30 seconds. The game server is busy; the dashboard keeps trying.",
+  PLAYERBOTS_DASHBOARD_REQUEST_EXPIRED: "EveJS was too busy to answer in time. The dashboard keeps trying.",
   PLAYERBOT_SETTINGS_INVALID: "EveJS rejected these settings.",
 };
 

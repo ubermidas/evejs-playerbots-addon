@@ -648,7 +648,7 @@ function getUserDataForCharacterId(charId) {
     corporationID: Number(charData.corporationID || 0),
     allianceID: Number(charData.allianceID || 0),
     // warFactionID means militia enlistment, not the character's empire faction.
-    warFactionID: Number(charData.warFactionID || 0),
+    warFactionID: Number(require("../corporation/fwCharacterEnlistmentMgrService").getPersistedEnlistmentFactionID(charId) || 0),
     typeID: Number(charData.typeID || 1373),
     role: toBigInt(session ? session.role || 0 : 0),
     info: buildOwnerInfo(charData, charId),

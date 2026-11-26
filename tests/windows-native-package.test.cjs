@@ -41,7 +41,9 @@ test("0.2.152.10 installs are recognised for an in-place upgrade", () => {
   for (const [relative, entry] of Object.entries(previous.files)) {
     const next = overlay.files[relative];
     assert.ok(next, `${relative} was dropped; Disable could no longer remove it`);
-    assert.equal(next.stock, entry.stock, relative);
+    // Stock hashes only carry over while the package targets the same EveJS
+    // release; after an EveJS update the updater has already restored stock.
+    if (overlay.version === previous.version) assert.equal(next.stock, entry.stock, relative);
     const known = [next.native, next.previousNative, ...(next.olderNative || [])];
     assert.ok(known.includes(entry.native), `${relative}: 0.2.152.10 bytes not recognised`);
   }

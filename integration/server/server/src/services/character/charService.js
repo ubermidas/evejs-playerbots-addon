@@ -927,7 +927,11 @@ class CharService extends BaseService {
     ]);
     const userDetails = { type: "list", items: [userDetailsKeyVal] };
 
-    const trainingDetails = [null, null];
+    // Tranquility's answer for the extra training slots' end times is a list, empty
+    // when the account has none (the 2026-11 24.02 login recording). The client keeps
+    // it as the subscription timers' trainingEndTimes and would read each entry's
+    // trainingEnds, which a list of Nones does not have.
+    const trainingDetails = [];
 
     const characterDetails = [];
     for (const [charId, rawCharacter] of Object.entries(characters)) {
@@ -1569,9 +1573,12 @@ class CharService extends BaseService {
     return this.Handle_GetCharacterToSelect(args, session);
   }
 
+  // Tranquility answers False for an account with no lapsed Omega (the 24.02 login
+  // recording); the character selection screen shows its lapsed-time warning on
+  // a true answer.
   Handle_GetCharOmegaDowngradeStatus(args, session, kwargs) {
     log.debug("[CharService] GetCharOmegaDowngradeStatus");
-    return null;
+    return false;
   }
 
   Handle_SelectCharacterID(args, session, kwargs) {

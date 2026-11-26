@@ -615,6 +615,7 @@ function createNotification(characterID, options = {}) {
       return {
         success: true,
         notificationID: existing.notificationID,
+        created: existing.created,
         record: buildNotificationDTO(existing),
         reused: true,
       };
@@ -663,6 +664,7 @@ function createNotification(characterID, options = {}) {
   return {
     success: true,
     notificationID,
+    created: record.created,
     record: buildNotificationDTO(record),
   };
 }

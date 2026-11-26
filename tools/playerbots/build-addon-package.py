@@ -3,7 +3,7 @@
 
     python3 tools/playerbots/build-addon-package.py                 # dist/evejs-playerbots-addon-v<version>.zip
     python3 tools/playerbots/build-addon-package.py --manifest-only # refresh integration/manifest.json only
-    python3 tools/playerbots/build-addon-package.py --compat-root /path/to/stock/EveJS-261115.2
+    python3 tools/playerbots/build-addon-package.py --compat-root /path/to/stock/EveJS-261125.3
 
 The server files come from integration/server/ and the add-on from
 addons/playerbots/. Before packaging, integration/manifest.json is refreshed:
@@ -134,7 +134,7 @@ def main() -> int:
             "version": version,
             "evejsVersion": manifest["evejsVersion"],
             "apiVersion": 1,
-            "runtime": "node >= 24",
+            "runtime": "node >= 26",
             "process": "standalone",
             "sourceOverlay": "integration/manifest.json",
         }, indent=2) + "\n"

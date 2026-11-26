@@ -2,7 +2,7 @@
 
 // The interactive installer and its native (EVEJS Launcher / StartServer.bat)
 // routes. A stand-in `docker` and `node` on PATH record what the installer
-// runs, so no EveJS server, Docker or Node.js 24 is needed.
+// runs, so no EveJS server, Docker or Node.js 26 is needed.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -24,11 +24,11 @@ function setup() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "playerbots-native-"));
   const evejs = path.join(root, "evejs");
   for (const dir of ["server", "docker", "config"]) fs.mkdirSync(path.join(evejs, dir), { recursive: true });
-  fs.writeFileSync(path.join(evejs, "package.json"), JSON.stringify({ version: "261115.2" }));
-  fs.writeFileSync(path.join(evejs, "server/package.json"), JSON.stringify({ version: "261115.2" }));
+  fs.writeFileSync(path.join(evejs, "package.json"), JSON.stringify({ version: "261125.3" }));
+  fs.writeFileSync(path.join(evejs, "server/package.json"), JSON.stringify({ version: "261125.3" }));
   fs.writeFileSync(path.join(evejs, "docker/entrypoint.sh"), "#!/bin/sh\n");
   fs.writeFileSync(path.join(evejs, "compose.yaml"), "services: {}\n");
-  fs.writeFileSync(path.join(evejs, "config/version.json"), JSON.stringify({ evejsVersion: "261115.2" }));
+  fs.writeFileSync(path.join(evejs, "config/version.json"), JSON.stringify({ evejsVersion: "261125.3" }));
   fs.writeFileSync(path.join(evejs, "config/server.json"), JSON.stringify({ network: { serverPort: 26000 } }));
   const log = path.join(root, "calls.log");
   const bin = path.join(root, "bin");
@@ -38,12 +38,12 @@ open(${JSON.stringify(log)}, "a").write("docker " + " ".join(args) + "\\n")
 if "ps" in args and "json" in args:
     print(json.dumps([{"Service": args[-1], "State": "running", "Health": "healthy"}]))
 `);
-  // Stand-in for Node.js 24 running a package's helper.cjs: it records the
+  // Stand-in for Node.js 26 running a package's helper.cjs: it records the
   // request and answers like the real helper, updating the overlay state.
   tool(bin, "node", `import json, os, sys
 args = sys.argv[1:]
 if args == ["--version"]:
-    print("v24.11.0"); sys.exit(0)
+    print("v26.13.1"); sys.exit(0)
 request = json.load(open(args[args.index("--request") + 1]))
 open(${JSON.stringify(log)}, "a").write("node " + args[0] + " " + request["action"] + "\\n")
 open(${JSON.stringify(path.join(root, "request.json"))}, "w").write(json.dumps(request))
@@ -145,23 +145,23 @@ test("the direct route refuses to upgrade over a launcher-managed install", () =
 });
 
 test("the real launcher helper accepts the installer's request", () => {
-  // Run windows-native/helper.cjs in a sandbox that reports Node.js 24, with
+  // Run windows-native/helper.cjs in a sandbox that reports Node.js 26, with
   // the request install.py builds. It must get past its protocol check and
   // stop on the fake folder's missing EveJS files instead.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "playerbots-helper-"));
   fs.mkdirSync(path.join(root, "evejs/config"), { recursive: true });
-  fs.writeFileSync(path.join(root, "evejs/config/version.json"), JSON.stringify({ evejsVersion: "261115.2" }));
+  fs.writeFileSync(path.join(root, "evejs/config/version.json"), JSON.stringify({ evejsVersion: "261125.3" }));
   const requestFile = path.join(root, "request.json");
   const resultFile = path.join(root, "result.json");
   fs.writeFileSync(requestFile, JSON.stringify({
     protocol: "evejs_launcher_mod_v1", requestId: "test", action: "install", profile: null,
     runtime: { backend: "native", evejsRoot: path.join(root, "evejs") }, mod: { id: "evejs-playerbots-native" },
   }));
-  const overlay = { version: "261115.2", files: {}, multicore: { tcp: {}, dependencies: [] } };
+  const overlay = { version: "261125.3", files: {}, multicore: { tcp: {}, dependencies: [] } };
   const helper = path.join(repo, "windows-native/helper.cjs");
   const sandboxRequire = (id) => (id === "./overlay.json" ? overlay : require(id));
   const fakeProcess = { argv: ["node", helper, "--request", requestFile, "--result", resultFile],
-    versions: { node: "24.11.0" }, exitCode: 0 };
+    versions: { node: "26.13.1" }, exitCode: 0 };
   return new Promise((resolve, reject) => {
     vm.runInNewContext(fs.readFileSync(helper, "utf8"), {
       require: sandboxRequire, process: fakeProcess, console, __dirname: path.dirname(helper),

@@ -10,6 +10,7 @@ const { cloneValue: walkCloneValue } = require("../../common/clone");
 const securityBindings = require("../../contentPacks/securityMissionBinding");
 const { buildLegacyTemplate } = require("./capturedSecurityLegacyScenes");
 const { normalizeTemplateRoomFrameOffsets } = require("./roomFramePositions");
+const { isNativeInsurgencyTemplate } = require("./pirateInsurgencyArchetypes");
 const { applyFlashpointContent } = require("../observatoryFlashpoint/flashpointCatalog");
 
 const {
@@ -151,6 +152,7 @@ function buildTemplateSelectionDescriptor(template = {}) {
     factionScope: copySelectionScalar(source.factionScope),
     dedRating: copySelectionScalar(source.dedRating),
     randomSpawnEligible: source.randomSpawnEligible === true,
+    metadataOnly: source.metadataOnly === true,
     sourceMissionID: copySelectionScalar(source.sourceMissionID),
     missionID: copySelectionScalar(source.missionID),
     sourceUrl: copySelectionScalar(source.sourceUrl),
@@ -293,6 +295,7 @@ function buildCache() {
       securityMissionBindingsByID.set(mission.missionID, freezeDeep(clone({
         templateID, missionID: mission.missionID, dungeonID: mission.dungeonID,
         agentLevel: mission.agentLevel,
+        legacyRestoreOnly: mission.legacyRestoreOnly === true,
         factionID: mission.nativeMission.factionID || 0,
         corporationID: mission.nativeMission.corporationID || 0,
         agentTypeID: mission.nativeMission.agentTypeID || 0,
@@ -307,6 +310,7 @@ function buildCache() {
     }
     // Compiled packs give a later room's content in the dungeon's frame;
     // the runtime adds content offsets to the room's anchor (roomFramePositions.js).
+    const archetypeID = template?.archetypeID == null ? null : toInt(template.archetypeID, 0);
     const normalizedTemplate = {
       ...normalizeTemplateRoomFrameOffsets(template).template,
       templateID,
@@ -316,10 +320,8 @@ function buildCache() {
         template && template.sourceDungeonID != null
           ? toInt(template.sourceDungeonID, 0)
           : null,
-      archetypeID:
-        template && template.archetypeID != null
-          ? toInt(template.archetypeID, 0)
-          : null,
+      archetypeID,
+      ...(isNativeInsurgencyTemplate(templateID, archetypeID) ? { siteKind: "anomaly" } : {}),
     };
     templatesByID.set(templateID, normalizedTemplate);
     if (isSecurityAlias) {

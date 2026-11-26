@@ -13,8 +13,8 @@ Compose**, or on Windows as a mod for **EVEJS Launcher** with no Docker.
 
 | | |
 | --- | --- |
-| **Version** | 0.2.152 (native package 0.2.152.16), experimental test build |
-| **Works with** | EveJS `261115.2`, with Docker Compose, or natively with EVEJS Launcher 1.0.91+ or `StartServer.bat` |
+| **Version** | 0.2.152 (native package 0.2.152.17), experimental test build |
+| **Works with** | EveJS `261125.3`, with Docker Compose, or natively with EVEJS Launcher 1.0.91+ or `StartServer.bat` |
 | **Dashboard** | `http://127.0.0.1:8080` on the server machine |
 | **License** | AGPL-3.0-only |
 
@@ -50,7 +50,7 @@ someone changed by hand.
 
 ### Docker
 
-You need EveJS **261115.2** set up with Docker, **Docker** with the Compose
+You need EveJS **261125.3** set up with Docker, **Docker** with the Compose
 v2 plugin, **Python 3.10+**, and EveJS's **Market** service running
 (EveJS's own tools build the market; see `doc/SETUP.md` in EveJS).
 
@@ -68,9 +68,9 @@ mode or Server Panel? Give the installer your extra Compose files once; see
 
 ### Native: EVEJS Launcher or StartServer.bat (no Docker)
 
-You need EveJS **261115.2** run natively with **Node.js 24+**, and Python
+You need EveJS **261125.3** run natively with **Node.js 26.13+** (what EveJS 261125.3 requires), and Python
 3.10+ for the installer. The native package is
-`evejs-playerbots-windows-v0.2.152.16.zip`, built from the same source as the
+`evejs-playerbots-windows-v0.2.152.17.zip`, built from the same source as the
 Docker add-on and carrying the Luna update by @xrizonx.
 
 - **Through EVEJS Launcher (1.0.91+), recommended if you use it.** The

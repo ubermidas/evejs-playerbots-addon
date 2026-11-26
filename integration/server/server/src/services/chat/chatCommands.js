@@ -425,6 +425,11 @@ const AVAILABLE_SLASH_COMMANDS = [
   "probe2",
   "trig",
   "setstanding",
+  "fwclearhold",
+  "fwenlist",
+  "fwretire",
+  "fwtimer",
+  "fwvp",
   "maxagentstandings",
   "fullstandings",
   "sigs",
@@ -645,6 +650,8 @@ const COMMANDS_HELP_TEXT = [
   "/probe2",
   "/trig [hull|family]",
   "/setstanding <value> <owner name|id> [target]",
+  "/fwclearhold [character] | /fwenlist <factionID> [character] | /fwretire [character] | /fwtimer <seconds>",
+  "/fwvp [points]",
   "/maxagentstandings [target]",
   "/fullstandings [target]",
   "/sigs",
@@ -2963,6 +2970,9 @@ function executeChatCommand(session, rawMessage, chatHub, options = {}) {
 
   if (command === "setstanding") {
     return handleSetStandingCommand(session, argumentText, chatHub, options);
+  }
+  if (["fwclearhold", "fwenlist", "fwretire", "fwtimer", "fwvp"].includes(command)) {
+    return require("./commands/factionWarfare").executeFactionWarfareCommand(session, command, argumentText, chatHub, options);
   }
 
   if (command === "maxagentstandings" || command === "fullstandings") {

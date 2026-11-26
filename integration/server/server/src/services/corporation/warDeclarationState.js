@@ -14,7 +14,9 @@ const { cloneValue, ensureRuntimeInitialized, updateRuntimeState } = require("./
 
 const TABLE = "corporationRuntime";
 const WEEK = 6048000000000n;
-const FEE = 100000000;
+// evewar/const.py COST_OF_WAR: 100000000 in build 3396210, 500000000 in 3693310 (the
+// declare window prints it as the cost).
+const FEE = 500000000;
 const DURABLE_DECLARATION_JOB_TYPE = "war-declaration.settle";
 const lanes = new Map();
 let durableScheduler = null;

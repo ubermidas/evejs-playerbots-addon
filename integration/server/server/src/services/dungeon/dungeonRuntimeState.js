@@ -20,6 +20,7 @@ const {
 } = require(path.join(__dirname, "../agent/missionAuthority"));
 const { createInstanceTable, updateInstanceTable } = require("./dungeonInstanceTable");
 const { resolveSavedTemplateID } = require("./capturedSecurityLegacyScenes");
+const { isNativeInsurgencyTemplate } = require("./pirateInsurgencyArchetypes");
 const {
   buildPendingSiteHazardEntry,
   listPendingSiteHazardEntries,
@@ -87,9 +88,14 @@ let coldPendingSiteHazardEntries = null;
 // Only reuse the cache as a persistence mirror after a fully successful write.
 let persistedMirrorTrusted = false;
 
+// The durable copy comes from gameStore memory (see gameStore.readDurable), not a
+// SQLite read back through the instance view.
 function readPersistedTable(table, pathArg) {
   if (repo && typeof repo.readPersisted === "function") {
     return repo.readPersisted(table, pathArg);
+  }
+  if (gameStore && typeof gameStore.readDurable === "function") {
+    return gameStore.readDurable(table, pathArg);
   }
   if (gameStore && typeof gameStore.readPersisted === "function") {
     return gameStore.readPersisted(table, pathArg);
@@ -415,21 +421,27 @@ function normalizeInstanceRecord(record = {}) {
 
   const objectiveSatisfiedAtMs = Math.max(0, toInt(record.objectiveSatisfiedAtMs, 0));
   const objectiveSatisfiedReason = normalizeText(record.objectiveSatisfiedReason, "") || null;
+  const templateID = resolveSavedTemplateID(normalizeText(record.templateID, ""), record);
+  const instanceScope = normalizeStateName(record.instanceScope, "shared");
+  const siteKind = normalizeLowerText(record.siteKind, "unknown");
+  const archetypeID = toOptionalInt(record.archetypeID);
+  const misplacedInsurgency = instanceScope === "shared" && siteKind === "signature" &&
+    isNativeInsurgencyTemplate(templateID, archetypeID);
 
   return {
     instanceID,
-    templateID: resolveSavedTemplateID(normalizeText(record.templateID, ""), record),
+    templateID,
     solarSystemID: Math.max(0, toInt(record.solarSystemID, 0)),
     siteKey: normalizeText(record.siteKey, "") || null,
     lifecycleState,
     lifecycleReason: normalizeText(record.lifecycleReason, "") || null,
-    instanceScope: normalizeStateName(record.instanceScope, "shared"),
+    instanceScope,
     siteFamily: normalizeLowerText(record.siteFamily, "unknown"),
-    siteKind: normalizeLowerText(record.siteKind, "unknown"),
+    siteKind: misplacedInsurgency ? "anomaly" : siteKind,
     siteOrigin: normalizeLowerText(record.siteOrigin, "unknown"),
     source: normalizeLowerText(record.source, "unknown"),
     sourceDungeonID: toOptionalInt(record.sourceDungeonID),
-    archetypeID: toOptionalInt(record.archetypeID),
+    archetypeID,
     factionID: toOptionalInt(record.factionID),
     difficulty: toOptionalInt(record.difficulty),
     entryObjectTypeID: toOptionalInt(record.entryObjectTypeID),

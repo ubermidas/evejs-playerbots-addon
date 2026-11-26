@@ -330,6 +330,39 @@ const {
 
 module.exports = {
 
+// Queued warp admission runs before the normal gameplay recharge pass. If it
+// needs this tick's sample, settle it there and consume the same elapsed time
+// only once, even when another warp order for the ship applies in this tick.
+settlePassiveCapacitorForTick(entity) {
+    if (this._earlyCapacitorRecharge?.has(entity)) return;
+    if (this._applyingMovementQueue === true) {
+      this._earlyCapacitorRecharge ??= new Set();
+      this._earlyCapacitorRecharge.add(entity);
+    }
+    const capacity = toFiniteNumber(entity.capacitorCapacity, 0);
+    const rechargeMs = toFiniteNumber(entity.capacitorRechargeRate, 0);
+    const ratio = getEntityCapacitorRatio(entity);
+    if (capacity <= 0 || rechargeMs <= 0 || ratio >= 1) return;
+
+    // The nonlinear recharge curve peaks at 25 percent of capacity.
+    const rechargedRatio = advancePassiveRechargeRatio(
+      ratio, this._activeTickDeltaSeconds, rechargeMs / 1000,
+    );
+    const newRatio = settlePassiveRechargeRatio(rechargedRatio, capacity);
+    if (newRatio === ratio) return;
+    setEntityCapacitorRatio(entity, newRatio);
+
+    const now = this._activeTickNowMs;
+    const lastCapNotify = toFiniteNumber(entity._lastCapNotifyAtMs, 0);
+    if (now - lastCapNotify >= 500) {
+      persistEntityCapacitorRatio(entity);
+      if (entity.session && isReadyForDestiny(entity.session)) {
+        notifyCapacitorChangeToSession(entity.session, entity, now, capacity * ratio);
+      }
+      entity._lastCapNotifyAtMs = now;
+    }
+  },
+
 // The Gameplay tick: one 100 ms step of the Solar system's gameplay. The
 // Destiny ticks due run first (runtime/destinyTick.js), right after
 // the sim clock advances: as many as the driver says are due at the sim time
@@ -356,6 +389,7 @@ tick(wallclockNow) {
     this._nextTickSequence += 1;
     this._activeTickDeltaSeconds = deltaSeconds;
     this._activeTickNowMs = now;
+    this._earlyCapacitorRecharge?.clear();
     this._tickTargetingStatsCache = new Map();
     // Each in-space pilot's clock snapshot (session._space.simTimeMs, its
     // file time and Time Dilation) is what gameplay reads as "now" for that
@@ -424,7 +458,7 @@ tick(wallclockNow) {
     try {
       const crimewatchState = lazyRequire("../services/security/crimewatchState");
       if (crimewatchState && typeof crimewatchState.tickScene === "function") {
-        tickProfiler.section("crimewatch", () => crimewatchState.tickScene(this, now));
+        tickProfiler.section("crimewatch", () => crimewatchState.tickScene(this, clockState.wallclockNowMs));
       }
     } catch (error) {
       log.warn(`[SpaceRuntime] Crimewatch tick failed for system=${this.systemID}: ${error.message}`);
@@ -1448,6 +1482,19 @@ tick(wallclockNow) {
             }
             continue;
           }
+          if (effectState.assistanceModuleEffect === true &&
+              !lazyRequire("../services/security/crimewatchState").evaluateRemoteAssistance(
+                this, entity, this.getEntityByID(toInt(effectState.targetID, 0)),
+              ).success) {
+            if (entity.session && isReadyForDestiny(entity.session)) {
+              finalizeDeactivation(entity.session, effectState.moduleID, { reason: "target", nowMs: cycleBoundaryMs });
+            } else {
+              finalizeGenericModuleDeactivationWithoutSession(this, entity, effectState, {
+                reason: "target", nowMs: cycleBoundaryMs,
+              });
+            }
+            continue;
+          }
           const cycleFuelConsumptionResult = terminalFinalEffectDue
             ? { success: true }
             : consumeShipModuleFuelForSession(
@@ -1878,7 +1925,7 @@ tick(wallclockNow) {
                   : this.getEntityByID(toInt(effectState.targetID, 0));
               const targetSession = targetEntity && targetEntity.session ? targetEntity.session : null;
               if (targetEntity && cycleResult.data && cycleResult.data.aggregateChanged) {
-                this.refreshShipEntityDerivedState(targetEntity, {
+                hostileModuleRuntime.refreshHostileTargetDerivedState(this, targetEntity, {
                   session: targetSession,
                   broadcast: true,
                   notifyTargeting: true,
@@ -2279,57 +2326,8 @@ tick(wallclockNow) {
       // -----------------------------------------------------------------
       advanceEntityRackHeat(this, entity, now);
 
-      // -----------------------------------------------------------------
-      // CCP parity: Non-linear capacitor recharge.
-      //
-      // Formula (instantaneous rate):
-      //   dC/dt = (10 * Cmax / tau) * ( sqrt(C/Cmax) - C/Cmax )
-      //
-      // Where Cmax = capacitorCapacity (GJ), tau = rechargeRate (ms → s),
-      // C = current capacitor level.  Peak recharge occurs at exactly 25%
-      // capacitor.  This matches CCP's Dogma engine as verified by
-      // community tools (Pyfa, EFT) and the EVE University wiki.
-      //
-      // Notifications are throttled to ~500 ms to avoid flooding the
-      // client (which itself only polls at 500 ms intervals).
-      // -----------------------------------------------------------------
-      if (
-        (
-          entity.kind === "ship" ||
-          controlledStaticStructureDogmaHosts.has(entity)
-        ) &&
-        toFiniteNumber(entity.capacitorCapacity, 0) > 0 &&
-        toFiniteNumber(entity.capacitorRechargeRate, 0) > 0
-      ) {
-        const capRatio = getEntityCapacitorRatio(entity);
-        if (capRatio < 1) {
-          const Cmax = entity.capacitorCapacity;
-          const tauSeconds = entity.capacitorRechargeRate / 1000;
-          const previousChargeAmount = Cmax * capRatio;
-          const rechargedRatio = advancePassiveRechargeRatio(
-            capRatio,
-            deltaSeconds,
-            tauSeconds,
-          );
-          const newRatio = settlePassiveRechargeRatio(rechargedRatio, Cmax);
-          if (newRatio !== capRatio) {
-            setEntityCapacitorRatio(entity, newRatio);
-            // Throttle persistence and client notifications to ~500 ms.
-            const lastCapNotify = toFiniteNumber(entity._lastCapNotifyAtMs, 0);
-            if (now - lastCapNotify >= 500) {
-              persistEntityCapacitorRatio(entity);
-              if (entity.session && isReadyForDestiny(entity.session)) {
-                notifyCapacitorChangeToSession(
-                  entity.session,
-                  entity,
-                  now,
-                  previousChargeAmount,
-                );
-              }
-              entity._lastCapNotifyAtMs = now;
-            }
-          }
-        }
+      if (entity.kind === "ship" || controlledStaticStructureDogmaHosts.has(entity)) {
+        this.settlePassiveCapacitorForTick(entity);
       }
 
       // Controlled structures share the generic module-cycle and capacitor
@@ -2508,6 +2506,11 @@ tick(wallclockNow) {
     spatialTrace.recordSimulationState(this, now);
     // Locks, tethers, NPC relevance, arrivals, HUD and cloak timers: no
     // visibility work is left here.
+    try {
+      require("../ordinaryLogoff").processScene(this, clockState.wallclockNowMs);
+    } catch (error) {
+      log.warn(`[SpaceRuntime] Offline ship tick failed for system=${this.systemID}: ${error.message}`);
+    }
     // Safe logoff, last: a countdown whose deadline has passed logs its pilot
     // off; one whose conditions broke is aborted. Its deadline is wall-clock
     // time.

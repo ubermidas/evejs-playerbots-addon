@@ -3,6 +3,29 @@
 Newest first. The Docker add-on keeps the upstream version number (0.2.152);
 the Windows launcher package adds a fourth number for its own releases.
 
+## Unreleased: EveJS 261125.3 and a dashboard that keeps up
+
+- **Works with EveJS 261125.3** (was 261115.2). The 34 server files whose
+  stock version changed were merged onto the new versions; see the pull
+  request for the hand-resolved ones. EveJS 261125.3 needs Node.js 26, so the
+  installer and the launcher package now ask for 26. Native package
+  0.2.152.17. The multicore TCP variant still targets the multicore build for
+  261115.2.
+- **Dashboard refreshes one request at a time.** The page used a fixed timer
+  that started a new refresh whether or not the last one had answered. When
+  EveJS was slow, requests stacked up behind the browser's six connections and
+  every page stopped loading. Refreshes now start a full interval after the
+  last one finished, hidden tabs stop polling, and the summary, activity and
+  pilot list load together instead of one after another.
+- **Live numbers.** The server kept a dashboard snapshot for 30 seconds,
+  twice the page's default refresh, so most refreshes showed old numbers. It
+  now keeps one for 5 seconds, and longer only when building it is expensive
+  (20 times its build time, at most 30 seconds).
+- **Less load from the dashboard.** Identical reads from several tabs or
+  views share one request to EveJS, and EveJS skips reads the dashboard has
+  already given up on instead of building answers nobody receives. When EveJS
+  does not answer in time the page says it is busy and keeps the last data.
+
 ## Unreleased: corporation hangars
 
 - Chat and dashboard orders accept `upgrade <bot> trade` (the hauler line) and

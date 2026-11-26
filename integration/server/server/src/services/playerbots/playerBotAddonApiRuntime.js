@@ -217,6 +217,17 @@ function createPlayerBotAddonApiRuntime(options = {}) {
       sendJson(response, 401, { error: "PLAYERBOTS_ADDON_UNAUTHORIZED" });
       return;
     }
+    // A dashboard read can wait in the socket queue while the game loop is
+    // busy. Once the dashboard has given up on it (its deadline header) or
+    // closed the connection, building the answer only adds to the backlog.
+    if (request.method === "GET" && url.pathname.startsWith("/v1/dashboard/")) {
+      const deadline = Number(request.headers["x-playerbots-deadline"]);
+      if (request.socket.destroyed || (Number.isFinite(deadline) && deadline > 0 && Date.now() > deadline)) {
+        telemetry.recordWork("dashboard.expired", 0);
+        if (!request.socket.destroyed) sendJson(response, 503, { error: "PLAYERBOTS_DASHBOARD_REQUEST_EXPIRED" });
+        return;
+      }
+    }
     if (request.method === "GET" && url.pathname === "/v1/roster") {
       const bots = playerBots.listBots();
       sendJson(response, 200, {

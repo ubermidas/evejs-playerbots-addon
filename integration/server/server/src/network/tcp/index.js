@@ -478,6 +478,7 @@ module.exports = function (serviceManager) {
   });
 
   let shutdownPromise = null;
+  let militiaSettlementTimer = null;
   let unregisterGameRuntimeShutdownHook = null;
   let unregisterSpaceTransitionShutdownHook = null;
   let unregisterShutdownHook = null;
@@ -492,6 +493,7 @@ module.exports = function (serviceManager) {
     },
     shutdown() {
       if (shutdownPromise) return shutdownPromise;
+      clearInterval(militiaSettlementTimer);
       // Log every pilot off now, while the store still takes writes. A
       // destroyed socket's close event fires only after the store has shut
       // down, which lost the ship's position and the logoff state.
@@ -575,6 +577,24 @@ module.exports = function (serviceManager) {
           );
         }
         tidiAutoscaler.init();
+        const { settleDue, reconcileMemberStandings } = require("../../services/faction/organizationEnlistment");
+        const hubRuntime = require("../../services/faction/fwHubRuntime");
+        let nextStandingCheck = 0;
+        const settleMilitias = () => {
+          const now = Date.now();
+          try { hubRuntime.settleDue(now); }
+          catch (error) { log.warn(`[FW] Pending hub settlement: ${error.message}`); }
+          try {
+            settleDue();
+            if (now >= nextStandingCheck) {
+              nextStandingCheck = now + 60000;
+              reconcileMemberStandings(now);
+            }
+          }
+          catch (error) { log.warn(`[FW] Pending organization enlistment settlement: ${error.message}`); }
+        };
+        settleMilitias();
+        militiaSettlementTimer = setInterval(settleMilitias, 1000).unref();
         resolve(runtime);
       } catch (error) {
         if (unregisterShutdownHook) {

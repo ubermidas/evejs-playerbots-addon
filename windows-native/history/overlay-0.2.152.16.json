@@ -255,6 +255,12 @@
       "native": "3dd050bfbdee73dfc206ec6bbacdefff59f5986785e4269b681532370dc8f4ee",
       "previousNative": "11486d52e799fb281aef8525769a4398f995f2a2f3a0d9f8cc1363bdb598ad6a"
     },
+    "server/src/gameStore/sqliteStore.js": {
+      "stock": "f1f5ca35c51037c416aa7f9283a8b4469004fe15988bcc8dd79e4e14d8debf8a",
+      "native": "815491022ddd9a58fada693e4f7bce9845d327a20f5c88a13b501a8985f94a33",
+      "previousNative": "08314b5856e27994b40350c3cc30790ea59a098707d9e88a9546808616a4a81e",
+      "adoptVerifiedStock": true
+    },
     "server/src/gameStore/tableOwnership.js": {
       "stock": "f33a8d203598f87a38a8cc0b8d1db909f39d6e77206d5c901f208c9715e50a38",
       "native": "fe5e8b1524b0ac5b0e449f461b8ce3e5c5fec351bc7d2f893c1aa238c6f67ec1"
@@ -364,6 +370,11 @@
       "native": "ef09f44998fdf7326750d6bf7eb33938c709a844dc54cec2cd71b74df0c1dae9",
       "previousNative": "d38e68bd7514c953ff4b2bf1eb0a0fce4d9051ede1230e418cc3fc751386d1a4"
     },
+    "server/src/services/dungeon/missionMiningSettlement.js": {
+      "stock": "606d60260328735d3de565ea21d47804b219d1e1bebede9dab2865db2553157a",
+      "native": "b3b4a3472cd370d64048dafeda45e6cef441d13acd57bedfc8fbe12b5a4de44a",
+      "adoptVerifiedStock": true
+    },
     "server/src/services/fleets/fleetRuntime.js": {
       "stock": "a676beaa6509cda39d640d86f13c91466b5cc0adcc70ee05c96aaa52e29f5371",
       "native": "d2f496dfeef2aea0c322b126a8fbe5c2ba3704bbe0bb4b997c12113507312b33"
@@ -420,6 +431,10 @@
       "olderNative": [
         "98a1923db67abd59bc364d7c6e93f07474781bd1052a05e01352816974766d58"
       ]
+    },
+    "server/src/services/playerbots/playerBotAgentMissionRuntime.js": {
+      "stock": null,
+      "native": "d42a1858341e842904ca669e54cbd31f574465c6bfc8d40d2d7638412d867749"
     },
     "server/src/services/playerbots/playerBotAllianceLogisticsRuntime.js": {
       "stock": null,
@@ -896,20 +911,6 @@
     "server/src/utils/deploymentHealthcheck.js": {
       "stock": "173711ca3fa39537a22312fc64615979320bc6f9fa062b977d114e4fcef00f13",
       "native": "c5083405e0a18121718b7968d1dacd721e7865199e6760d8b10eec4c0f363770"
-    },
-    "server/src/services/dungeon/missionMiningSettlement.js": {
-      "stock": "606d60260328735d3de565ea21d47804b219d1e1bebede9dab2865db2553157a",
-      "native": "b3b4a3472cd370d64048dafeda45e6cef441d13acd57bedfc8fbe12b5a4de44a",
-      "adoptVerifiedStock": true
-    },
-    "server/src/services/playerbots/playerBotAgentMissionRuntime.js": {
-      "stock": null,
-      "native": "d42a1858341e842904ca669e54cbd31f574465c6bfc8d40d2d7638412d867749"
-    },
-    "server/src/gameStore/sqliteStore.js": {
-      "stock": "f1f5ca35c51037c416aa7f9283a8b4469004fe15988bcc8dd79e4e14d8debf8a",
-      "native": "08314b5856e27994b40350c3cc30790ea59a098707d9e88a9546808616a4a81e",
-      "adoptVerifiedStock": true
     },
     "server/src/utils/rotatingLog.js": {
       "stock": "8ec6018f32153ff69c08b86afb523fee1960c89d66c17a2caf4f7c70e0b93fef",

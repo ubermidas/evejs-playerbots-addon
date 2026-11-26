@@ -3,6 +3,7 @@
 const runtimeEntryDirname = require("path").resolve(__dirname, "../..");
 const path = require("path");
 const log = require(path.join(runtimeEntryDirname, "../utils/logger"));
+const worldData = require("../../worldData");
 const {
   canEntitiesInteractLocally,
   isSharedPveTarget,
@@ -109,6 +110,7 @@ const {
   buildDockingDebugState,
   canShipDockAtStation,
 } = require("../stationDockingGeometry");
+const { getNpcStationDockingRefusal } = require("../../npcStationDocking");
 const {
   buildStructureDockingTransitionUpdates,
 } = require("../structureTether");
@@ -652,6 +654,15 @@ acceptDocking(session, stationID) {
         success: false,
         errorMsg: crimewatchDockingRestriction,
       };
+    }
+
+    if (station.kind === "station") {
+      const npcRefusal = getNpcStationDockingRefusal(
+        session.characterID,
+        worldData.getStationByID(station.itemID),
+        entity,
+      );
+      if (npcRefusal) return npcRefusal;
     }
 
     if (

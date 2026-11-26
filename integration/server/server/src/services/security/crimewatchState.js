@@ -2,6 +2,7 @@
 
 const { cloneValue: walkCloneValue } = require("../../common/clone");
 const { queueDogmaEvent } = require("../../space/runtime/dogmaEvents");
+const { getWallclockNowMs } = require("../../space/runtime/runtimeClock");
 
 const {
   toFiniteNumber,
@@ -33,6 +34,7 @@ const {
   findSafeWarpOriginAnchor,
 } = require(path.join(__dirname, "../../space/npc/npcWarpOrigins"));
 const {
+  CONCORD_RESPONSE_SPAWN_GROUP_ID,
   ENTITY_TYPE,
 } = require(path.join(__dirname, "../../space/entityConstants"));
 const {
@@ -43,6 +45,7 @@ const {
 ));
 const {
   getSolarSystemPseudoSecurity,
+  isExordiumSystem,
   isHighSecuritySystem,
   isLowSecuritySystem,
 } = require(path.join(__dirname, "systemSecurity"));
@@ -82,8 +85,14 @@ const SECURITY_STATUS_MAX = 10;
 const OUTLAW_SECURITY_STATUS = -5;
 const SECURITY_STATUS_SHIP_AGGRESSION_MODIFIER = -0.025;
 const SECURITY_STATUS_CAPSULE_AGGRESSION_MODIFIER = -0.25;
-const SECURITY_STATUS_ROUND_DIGITS = 4;
 const SECURITY_STATUS_DUPLICATE_WINDOW_MS = WEAPON_TIMER_DURATION_MS;
+// crimewatch/const.py groupsSkipCriminalFlags, which groupsSkipDisapprovalFlags
+// is the same list as: Gang Coordinator 316, Siege Module 515, Damage Control
+// 60 and, new in build 3693310, Micro Jump Field Generators 1533 and Capital
+// Mobility Modules 4769. An effect from a module in one of these groups is
+// not a criminal or suspect act. The client only holds the list; what the
+// server does with it is not in the client (see recordHighSecCriminalAggression).
+const GROUPS_SKIP_CRIMINAL_FLAGS = Object.freeze(new Set([316, 515, 60, 1533, 4769]));
 const GROUP_CAPSULE = 29;
 const GROUP_STARGATE = 10;
 const GROUP_STATION = 15;
@@ -119,7 +128,6 @@ const CONCORD_RESPONSE_WARP_SPEED_AU = 15;
 // as CCP's 2008 Serious Security blog and EVE University describe it. Their own
 // scan resolutions make the disable and the kill: the Captains lock a frigate in
 // about 2 s, and the Commander a battleship in about 15 s and a freighter in about 7 s.
-const CONCORD_RESPONSE_SPAWN_GROUP_ID = "concord_crimewatch_response";
 // Time from dispatch to the Captains' lock, measured in Jita: stopped on grid at
 // 4.5 s, wake at 5.1 s, then their own lock, 2.2 s on a frigate and 0.4 s on a
 // freighter. The published times were measured on gank ships between those.
@@ -149,6 +157,12 @@ const limitedEngagements = new Map();
 const hydratedLimitedEngagementKeys = new Set();
 let allLimitedEngagementsHydrated = false;
 const systemConcordResponses = new Map();
+const pendingAssistanceConsequences = new Map();
+const ASSISTANCE_TIMER_FIELDS = [
+  "weaponTimerExpiresAtMs",
+  "pvpTimerExpiresAtMs",
+  "npcTimerExpiresAtMs",
+];
 const lastBroadcastTimerSnapshots = new Map();
 const lastBroadcastFlagSnapshots = new Map();
 const lastBroadcastDisapprovalSnapshots = new Map();
@@ -156,6 +170,9 @@ const recentSecurityPenaltyTargets = new Map();
 // Live module references are deliberately transient. Durable expiries remain
 // finite, so restarting the server cannot leave an active timer stuck forever.
 const moduleCombatActivities = new Map();
+const COMBAT_REFRESH_INTERVAL_MS = 1_000;
+const COMBAT_SAVE_RETRY_MS = 2_000;
+let combatSaves = { pending: false, inFlight: false, retryAtMs: 0 };
 const characterCombatActivities = new Map();
 // Limited engagements the pilots' clients show as ongoing (-1) because an
 // offensive module between the pair is still running. Retail stops the
@@ -224,6 +241,23 @@ function findLegalWarAggression(attackerCharacterID, targetCharacterID, nowMs) {
     targetCharacterID,
     { nowMs },
   );
+}
+
+function isLegalMilitiaAggression(attackerCharacterID, targetCharacterID) {
+  if (!(attackerCharacterID > 0) || !(targetCharacterID > 0) || attackerCharacterID === targetCharacterID) return false;
+  const enlistment = require("../corporation/fwCharacterEnlistmentMgrService");
+  return require("../faction/factionWarfareAuthority").isCombatEnemyFaction(
+    enlistment.getPersistedEnlistmentFactionID(attackerCharacterID),
+    enlistment.getPersistedEnlistmentFactionID(targetCharacterID),
+  );
+}
+
+function buildLegalMilitiaAggressionResult(state, characterID) {
+  return { success: true, data: {
+    applied: false, reason: "LEGAL_MILITIA_AGGRESSION", characterID,
+    weaponTimerExpiresAtMs: state.weaponTimerExpiresAtMs,
+    pvpTimerExpiresAtMs: state.pvpTimerExpiresAtMs,
+  } };
 }
 
 function resolveCharacterRecord(characterID) {
@@ -682,7 +716,7 @@ function isLegalCorporationPropertyFriendlyFire(
   }
 }
 
-function persistCharacterState(state) {
+function persistCharacterState(state, options) {
   const normalized = normalizeStoredCharacterState(
     state,
     state && state.characterID,
@@ -690,11 +724,11 @@ function persistCharacterState(state) {
   if (!normalized) {
     return { success: false, errorMsg: "INVALID_CHARACTER_STATE" };
   }
-  return crimewatchRuntimeState.upsertCharacterState(normalized);
+  return crimewatchRuntimeState.upsertCharacterState(normalized, options);
 }
 
-function finalizeCharacterStateMutation(state, result) {
-  const persistenceResult = persistCharacterState(state);
+function finalizeCharacterStateMutation(state, result, options) {
+  const persistenceResult = persistCharacterState(state, options);
   if (!persistenceResult || persistenceResult.success !== true) {
     return {
       success: false,
@@ -946,7 +980,7 @@ function createOrRefreshLimitedEngagement(
   try {
     persistenceResult = options.duelReceiptID
       ? crimewatchRuntimeState.upsertDuelEngagement(engagement, options.duelReceiptID)
-      : crimewatchRuntimeState.upsertLimitedEngagement(engagement);
+      : crimewatchRuntimeState.upsertLimitedEngagement(engagement, { durable: !options.ongoingRefresh });
   } catch (error) {
     if (options.duelReceiptID) rollbackDuelCache();
     throw error;
@@ -957,7 +991,7 @@ function createOrRefreshLimitedEngagement(
       hydratedLimitedEngagementKeys.add(key);
     } else rollbackDuelCache();
   }
-  if (!options.duelReceiptID || persistenceResult?.success) {
+  if (!options.ongoingRefresh && (!options.duelReceiptID || persistenceResult?.success)) {
     notifyLimitedEngagementChanged(engagement, !existing);
   }
   if (!persistenceResult || persistenceResult.success !== true) {
@@ -1244,7 +1278,8 @@ function holdOngoingLimitedEngagementsForParticipants(participants, now) {
     if (!ongoingLimitedEngagementKeys.has(key)) return;
     const existing = getLimitedEngagement(first, second, now);
     if (!existing) return;
-    createOrRefreshLimitedEngagement(first, second, { now, reason: existing.reason });
+    const result = createOrRefreshLimitedEngagement(first, second, { now, reason: existing.reason, ongoingRefresh: true });
+    if (result.success) combatSaves.pending = true;
   });
 }
 
@@ -1568,18 +1603,10 @@ function resolveSecurityStatusShipEntity(scene, entity, session) {
   return ship && ship.session === session ? ship : resolved;
 }
 
-function roundSecurityStatus(value) {
-  return Number(
-    toFiniteNumber(value, 0).toFixed(SECURITY_STATUS_ROUND_DIGITS),
-  );
-}
-
 function clampSecurityStatus(value) {
-  return roundSecurityStatus(
-    Math.max(
-      SECURITY_STATUS_MIN,
-      Math.min(SECURITY_STATUS_MAX, toFiniteNumber(value, 0)),
-    ),
+  return Math.max(
+    SECURITY_STATUS_MIN,
+    Math.min(SECURITY_STATUS_MAX, toFiniteNumber(value, 0)),
   );
 }
 
@@ -1689,17 +1716,27 @@ function setCharacterSecurityStatus(
   }
 
   const previousSecurityStatus = getCharacterSecurityStatus(normalizedCharacterID, 0);
-  const clampedSecurityStatus = clampSecurityStatus(nextSecurityStatus);
-  const updateResult = updateCharacterStateRecord(normalizedCharacterID, (record) => ({
-    ...record,
-    securityStatus: clampedSecurityStatus,
-    securityRating: clampedSecurityStatus,
-  }));
+  const exchangeID = options.securityTagExchangeID;
+  const replay = exchangeID && characterRecord.lastSecurityTagExchangeID === exchangeID;
+  const clampedSecurityStatus = replay ? previousSecurityStatus : clampSecurityStatus(nextSecurityStatus);
+  const updateResult = replay ? { success: true } :
+    updateCharacterStateRecord(normalizedCharacterID, (record) => ({
+      ...record,
+      securityStatus: clampedSecurityStatus,
+      securityRating: clampedSecurityStatus,
+      ...(exchangeID ? { lastSecurityTagExchangeID: exchangeID } : {}),
+    }));
   if (!updateResult.success) {
     return {
       success: false,
       errorMsg: updateResult.errorMsg || "WRITE_ERROR",
     };
+  }
+
+  if (exchangeID) {
+    const store = require("../../gameStore");
+    const flushed = store.flushTableSync(getCharacterStateService().CHARACTERS_TABLE);
+    if (!flushed?.success) return flushed || { success: false, errorMsg: "WRITE_ERROR" };
   }
 
   const liveEntity = resolveSecurityStatusShipEntity(
@@ -2371,10 +2408,8 @@ function buildSecurityStatusPenaltyResult({
     systemSecurity: roundNumber(toFiniteNumber(systemSecurity, 0), 6),
     previousSecurityStatus: clampSecurityStatus(previousSecurityStatus),
     nextSecurityStatus: clampSecurityStatus(nextSecurityStatus),
-    deltaSecurityStatus: roundSecurityStatus(
-      clampSecurityStatus(nextSecurityStatus) -
-        clampSecurityStatus(previousSecurityStatus),
-    ),
+    deltaSecurityStatus: clampSecurityStatus(nextSecurityStatus) -
+      clampSecurityStatus(previousSecurityStatus),
     targetSecurityStatus: clampSecurityStatus(targetSecurityStatus),
     modificationPercent: roundNumber(toFiniteNumber(modification, 0) * 100, 6),
   };
@@ -3464,7 +3499,7 @@ function evaluateOffensiveAggression(
   scene,
   attackerEntity,
   targetEntity,
-  now = Date.now(),
+  now = getWallclockNowMs(),
 ) {
   attackerEntity = resolveManualStarbaseAggressor(attackerEntity);
   if (!scene || !attackerEntity || !targetEntity) {
@@ -3501,6 +3536,8 @@ function evaluateOffensiveAggression(
     resolveEntityProtectedPropertyCorporationID(targetEntity);
   const targetIsPlayerProperty =
     targetCharacterID > 0 || targetProtectedPropertyCorporationID > 0;
+  const starterPvpBlocked = attackerCharacterID > 0 && targetIsPlayerProperty &&
+    attackerCharacterID !== targetCharacterID && isExordiumSystem(scene.system);
   const targetIsPersonalDeployable = isPersonalDeployableEntity(targetEntity);
   const targetIsOutlaw =
     targetCharacterID > 0 && isPlayerEntityOutlaw(targetEntity);
@@ -3513,7 +3550,11 @@ function evaluateOffensiveAggression(
   let requiredSafetyLevel = SAFETY_LEVEL_FULL;
   let legal = true;
 
-  if (attackerCharacterID > 0 && isNpcAuthorityStructure(targetEntity)) {
+  if (starterPvpBlocked) {
+    legal = false;
+    reason = "EXORDIUM_PLAYER_AGGRESSION";
+    consequence = "blocked";
+  } else if (attackerCharacterID > 0 && isNpcAuthorityStructure(targetEntity)) {
     consequence = getNpcAuthorityAggressionConsequence(scene, targetEntity);
     if (consequence !== "none") {
       legal = false;
@@ -3548,6 +3589,9 @@ function evaluateOffensiveAggression(
       reason = "TARGET_ALREADY_SUSPECT";
     } else if (targetIsOutlaw) {
       reason = "TARGET_OUTLAW";
+    } else if (targetProtectedPropertyCorporationID <= 0 &&
+        isLegalMilitiaAggression(attackerCharacterID, targetCharacterID)) {
+      reason = "LEGAL_MILITIA_AGGRESSION";
     } else {
       const legalWar = targetProtectedPropertyCorporationID > 0
         ? findLegalWarAggressionAgainstCorporation(
@@ -3609,7 +3653,7 @@ function evaluateOffensiveAggression(
     reason = "FRIENDLY_OR_SELF";
   }
 
-  const safetyAllows = safetyLevel <= requiredSafetyLevel;
+  const safetyAllows = !starterPvpBlocked && safetyLevel <= requiredSafetyLevel;
   return {
     success: safetyAllows,
     errorMsg: safetyAllows ? null : "SafetyActivated",
@@ -3648,6 +3692,154 @@ function buildLimitedEngagementLegalAggressionResult(
       limitedEngagementPersistenceError: legalAggression.persistenceError,
     },
   };
+}
+
+function isNeutralToActiveWar(sourceID, targetID, now) {
+  const { getPersistedEnlistmentFactionID } = require("../corporation/fwCharacterEnlistmentMgrService");
+  const { getCombatSide } = require("../faction/factionWarfareAuthority");
+  const source = resolveCharacterRecord(sourceID);
+  const target = resolveCharacterRecord(targetID);
+  const sourceSide = getCombatSide(getPersistedEnlistmentFactionID(sourceID, source));
+  const targetSide = getCombatSide(getPersistedEnlistmentFactionID(targetID, target));
+  if (targetSide && sourceSide !== targetSide) return true;
+  const sameCorporation = source?.corporationID > 0 && source.corporationID === target?.corporationID;
+  const sameAlliance = source?.allianceID > 0 && source.allianceID === target?.allianceID;
+  return !sameCorporation && !sameAlliance &&
+    getWarRuntimeStateService().hasActiveWarForCharacter(targetID, { nowMs: now });
+}
+
+function evaluateRemoteAssistance(scene, source, target, now = getWallclockNowMs()) {
+  const sourceID = getEntityCharacterID(source);
+  const targetID = getEntityCharacterID(target);
+  if (!sourceID || !targetID || sourceID === targetID) return { success: true };
+  if (pendingAssistanceConsequences.has(sourceID)) {
+    return { success: false, errorMsg: "CRIMEWATCH_STATE_PERSIST_FAILED" };
+  }
+  const targetState = getCharacterCrimewatchState(targetID, now);
+  const deliveredAtMs = Math.trunc(now);
+  const highsec = isHighSecuritySystem(scene.system);
+  const empireSpace = highsec || isLowSecuritySystem(scene.system);
+  let penalty = null;
+  let penaltyExpiresAtMs = 0;
+  if (empireSpace) {
+    const outsideEngagement = listLimitedEngagementsForCharacter(targetID, now).some(engagement =>
+      getLimitedEngagementOtherCharacterID(engagement, targetID) !== sourceID);
+    const neutralWar = targetState?.pvpTimerExpiresAtMs > now &&
+      isNeutralToActiveWar(sourceID, targetID, now);
+    if (outsideEngagement || neutralWar) {
+      penalty = highsec ? "criminal" : "suspect";
+      penaltyExpiresAtMs = deliveredAtMs + CRIMINAL_TIMER_DURATION_MS;
+    }
+    const inherited = targetState?.criminalTimerExpiresAtMs > now &&
+      (targetState.criminal ? "criminal" : targetState.suspect ? "suspect" : null);
+    if (inherited && (penalty !== "criminal" || inherited === "criminal")) {
+      penalty = inherited;
+      penaltyExpiresAtMs = Math.max(penaltyExpiresAtMs, targetState.criminalTimerExpiresAtMs);
+    }
+  }
+  const requiredSafetyLevel = penalty === "criminal" ? SAFETY_LEVEL_NONE
+    : penalty === "suspect" ? SAFETY_LEVEL_PARTIAL : SAFETY_LEVEL_FULL;
+  const safetyLevel = getSafetyLevel(sourceID);
+  const timers = Object.fromEntries(ASSISTANCE_TIMER_FIELDS.map(field =>
+    [field, targetState?.[field] > now ? targetState[field] : 0]));
+  const consequence = penalty || Object.values(timers).some(Boolean)
+    ? { ...timers, penalty, penaltyExpiresAtMs, deliveredAtMs }
+    : null;
+  return {
+    success: safetyLevel <= requiredSafetyLevel,
+    errorMsg: safetyLevel > requiredSafetyLevel ? "SafetyActivated" : null,
+    data: { sourceID, penalty, penaltyExpiresAtMs, requiredSafetyLevel, safetyLevel, consequence },
+  };
+}
+
+function recordRemoteAssistance(scene, source, target, nowMs, evaluation = evaluateRemoteAssistance(scene, source, target, nowMs)) {
+  if (!evaluation.success || !evaluation.data?.consequence) return evaluation;
+  const { sourceID, consequence } = evaluation.data;
+  const delivery = { characterID: sourceID, sourceShipID: source.itemID, systemID: scene.systemID, consequence, scene };
+  const result = applyDeliveredAssistance(delivery, consequence.deliveredAtMs);
+  if (!result.success) {
+    pendingAssistanceConsequences.set(sourceID, {
+      delivery: { ...delivery, scene: null }, retryAtMs: consequence.deliveredAtMs + 1_000,
+    });
+  }
+  return result;
+}
+
+function assistancePenaltyCoveredBy(state, consequence, now) {
+  const { penalty, penaltyExpiresAtMs, deliveredAtMs } = consequence;
+  if (!penalty || penaltyExpiresAtMs <= now) return true;
+  const flag = state?.nonTheftPenalty;
+  return flag?.criminalTimerExpiresAtMs >= penaltyExpiresAtMs &&
+    (penalty === "criminal" ? flag.criminal && state.lastCriminalAtMs >= deliveredAtMs : flag.criminal || flag.suspect);
+}
+
+function consequenceCoveredBy(state, consequence, now) {
+  return ASSISTANCE_TIMER_FIELDS.every(field => consequence[field] <= now || state?.[field] >= consequence[field]) &&
+    assistancePenaltyCoveredBy(state, consequence, now);
+}
+
+function applyDeliveredAssistance({ characterID, sourceShipID, systemID, consequence, scene }, now) {
+  const { penaltyExpiresAtMs, deliveredAtMs } = consequence;
+  const penalty = penaltyExpiresAtMs > now ? consequence.penalty : null;
+  const state = ensureCharacterState(characterID);
+  if (consequenceCoveredBy(state, consequence, now)) return { success: true };
+  const previous = cloneValue(state);
+  const flagChanged = !assistancePenaltyCoveredBy(state, consequence, now);
+  for (const field of ASSISTANCE_TIMER_FIELDS) {
+    if (consequence[field] > now) state[field] = Math.max(state[field], consequence[field]);
+  }
+  if (flagChanged) setNonTheftPenalty(state, penalty, penaltyExpiresAtMs, { now });
+  if (flagChanged && penalty === "criminal") state.lastCriminalAtMs = Math.max(state.lastCriminalAtMs, deliveredAtMs);
+  const session = sessionRegistry.findSessionByCharacterID(characterID);
+  const currentSystemID = resolveSessionSystemID(session);
+  state.lastKnownSystemID = currentSystemID || scene?.systemID || state.lastKnownSystemID || systemID;
+  let staged;
+  try {
+    staged = persistCharacterState(state, { durable: false });
+  } catch (error) {
+    staged = { success: false, errorMsg: error.message };
+  }
+  if (!staged?.success) {
+    replaceCharacterState(state, previous);
+    return { success: false, errorMsg: staged?.errorMsg || "CRIMEWATCH_STATE_PERSIST_FAILED" };
+  }
+  if (flagChanged) {
+    try {
+      const flushed = crimewatchRuntimeState.flushQueuedCharacterState();
+      if (!flushed?.success) throw new Error(flushed?.errorMsg || "FLUSH_ERROR");
+    } catch (error) {
+      log.warn(`[Crimewatch] Assistance flag is live and queued for persistence: ${error.message}`);
+    }
+  }
+  try {
+    if (scene?.systemID !== state.lastKnownSystemID) {
+      scene = require.cache[require.resolve("../../space/runtime")]?.exports?.scenes?.get(state.lastKnownSystemID);
+    }
+    const sourceShip = scene && resolveCurrentOffenderEntity(scene, characterID, sourceShipID);
+    if (flagChanged && penalty === "criminal" && isHighSecuritySystem(scene?.system) && sourceShip) {
+      scheduleConcordResponse(scene, sourceShip, now, null);
+    }
+    require("../ship/safeLogoffRuntime").handleCrimewatchStateChanged(state);
+    if (sourceShip?.session) synchronizeSessionTimerNotifications(scene, sourceShip.session, now);
+  } catch (error) {
+    log.warn(`[Crimewatch] Assistance timer notification failed: ${error.message}`);
+  }
+  return { success: true };
+}
+
+// The repair owner must keep its receipt until Crimewatch reaches its own
+// durable boundary. Retries use the same deadlines, so they cannot add time.
+function recordCommittedRemoteAssistance(delivery, { flush = false, now = getWallclockNowMs() } = {}) {
+  const { consequence, characterID } = delivery;
+  if (!consequence || consequenceCoveredBy(null, consequence, now)) return { success: true, durable: true };
+  const result = applyDeliveredAssistance(delivery, now);
+  if (!result.success) return result;
+  const isDurable = () => consequenceCoveredBy(
+    crimewatchRuntimeState.getCharacterState(characterID, { durable: true }), consequence, now);
+  if (isDurable()) return { success: true, durable: true };
+  if (!flush) return { success: true, durable: false };
+  const flushed = crimewatchRuntimeState.flushQueuedCharacterState();
+  return flushed?.success ? { success: true, durable: isDurable() } : flushed;
 }
 
 function triggerHighSecCriminalOffense(scene, attackerEntity, options = {}) {
@@ -3732,6 +3924,10 @@ function triggerHighSecCriminalOffense(scene, attackerEntity, options = {}) {
     targetCharacterID,
     now,
   );
+  if (resolveEntityProtectedPropertyCorporationID(targetEntity) <= 0 &&
+      isLegalMilitiaAggression(attackerCharacterID, targetCharacterID)) {
+    return buildLegalMilitiaAggressionResult(state, attackerCharacterID);
+  }
   if (legalWar) {
     return {
       success: true,
@@ -3949,7 +4145,12 @@ function buildModuleCombatParticipants(sourceEntity, targetEntity, aggressionRes
   return participants;
 }
 
-function extendModuleCombatTimers(scene, participants, now, notify = true) {
+function notifyModuleCombatTimers(scene, session, now) {
+  try { synchronizeSessionTimerNotifications(scene, session, now); }
+  catch (error) { log.debug(`[Crimewatch] Combat timer delivery failed: ${error.message}`); }
+}
+
+function extendModuleCombatTimers(scene, participants, now, routine = false, stoppingSessions = null) {
   let success = true;
   for (const [characterID, { entity, kinds }] of participants) {
     const state = ensureCharacterState(characterID);
@@ -3968,18 +4169,27 @@ function extendModuleCombatTimers(scene, participants, now, notify = true) {
       setNonTheftPenalty(state, "suspect", now + CRIMINAL_TIMER_DURATION_MS, { now });
     }
     state.lastKnownSystemID = toPositiveInt(scene && scene.systemID, state.lastKnownSystemID);
-    if (JSON.stringify(previous) !== JSON.stringify(state)) {
-      const result = finalizeCharacterStateMutation(state, { success: true });
+    if (JSON.stringify(previous) !== JSON.stringify(state) ||
+      (stoppingSessions && (combatSaves.pending || combatSaves.inFlight))) {
+      const changesPenalty = previous.criminal !== state.criminal || previous.suspect !== state.suspect ||
+        (state.criminalTimerExpiresAtMs > now && previous.criminalTimerExpiresAtMs <= now);
+      const deferred = routine && !changesPenalty;
+      const result = finalizeCharacterStateMutation(state, { success: true }, { durable: !deferred });
       if (!result.success) {
-        rollbackRejectedCharacterStateMutation(state, previous);
+        if (deferred) replaceCharacterState(state, previous);
+        else rollbackRejectedCharacterStateMutation(state, previous);
         success = false;
         log.warn(`[Crimewatch] Combat timer refresh failed for character=${characterID}`);
         continue;
       }
+      if (deferred) combatSaves.pending = true;
     }
-    if (notify && entity.session) {
-      try { synchronizeSessionTimerNotifications(scene, entity.session, now); }
-      catch (error) { log.debug(`[Crimewatch] Combat timer delivery failed: ${error.message}`); }
+    if (!routine && entity.session) {
+      if (stoppingSessions && kinds.has("weapons")) {
+        stoppingSessions.push(entity.session);
+      } else {
+        notifyModuleCombatTimers(scene, entity.session, now);
+      }
     }
   }
   return success;
@@ -3997,7 +4207,7 @@ function removeModuleCombatActivity(effectState, activity) {
 
 // The retail 101/201/301/302/401 states have no expiry. Hold them for the
 // committed offensive module's lifetime, including a requested final cycle.
-function beginModuleCombatActivity(scene, sourceEntity, targetEntity, effectState, now,
+function beginModuleCombatActivity(scene, sourceEntity, targetEntity, effectState, now = getWallclockNowMs(),
   aggressionResult = null) {
   if (!effectState || moduleCombatActivities.has(effectState)) return;
   const participants = buildModuleCombatParticipants(sourceEntity, targetEntity, aggressionResult);
@@ -4013,33 +4223,64 @@ function beginModuleCombatActivity(scene, sourceEntity, targetEntity, effectStat
   markLimitedEngagementsOngoingForParticipants(participants, now);
 }
 
-function endModuleCombatActivity(effectState, now) {
+function endModuleCombatActivity(effectState, now = getWallclockNowMs()) {
   const activity = moduleCombatActivities.get(effectState);
   if (!activity) return;
   activity.endedAtMs ??= now;
-  if (extendModuleCombatTimers(activity.scene, activity.participants, activity.endedAtMs)) {
+  if (activity.retryStopAtMs > now) return;
+  const stoppingSessions = [];
+  if (extendModuleCombatTimers(activity.scene, activity.participants, activity.endedAtMs, false, stoppingSessions)) {
     removeModuleCombatActivity(effectState, activity);
+  } else {
+    activity.retryStopAtMs = now + COMBAT_SAVE_RETRY_MS;
   }
   resumeLimitedEngagementTimeoutsForParticipants(activity.participants, activity.endedAtMs);
+  // The firing pilot sees the engagement countdown before its own timers.
+  for (const session of stoppingSessions) {
+    notifyModuleCombatTimers(activity.scene, session, activity.endedAtMs);
+  }
 }
 
 // A disposed scene never ticks again, so its activities are ended here: the
 // pilots' countdowns start from the disposal, and none is left showing an
 // active timer until a restart.
-function disposeSceneCombatActivities(scene, now = Date.now()) {
+function disposeSceneCombatActivities(scene, now = getWallclockNowMs()) {
   for (const [effectState, activity] of [...moduleCombatActivities]) {
     if (activity.scene !== scene) continue;
     endModuleCombatActivity(effectState, now);
-    removeModuleCombatActivity(effectState, activity);
+  }
+}
+
+async function flushCombatRefreshes(batch, now) {
+  batch.inFlight = true;
+  batch.pending = false;
+  let errorMsg;
+  try {
+    const result = await crimewatchRuntimeState.flushCombatRefreshes();
+    if (!result.success) errorMsg = result.errorMsg || "FLUSH_ERROR";
+  } catch (error) {
+    errorMsg = error.message || "FLUSH_ERROR";
+  } finally {
+    batch.inFlight = false;
+  }
+  if (errorMsg && batch === combatSaves) {
+    batch.pending = true;
+    batch.retryAtMs = Math.max(now, batch.observedAtMs) + COMBAT_SAVE_RETRY_MS;
+    if (errorMsg !== "SHUTDOWN") log.warn(`[Crimewatch] Combat timer checkpoint awaits retry: ${errorMsg}`);
   }
 }
 
 function refreshModuleCombatActivities(scene, now) {
+  const dueActivities = [];
+  const participants = new Map();
   for (const [effectState, activity] of moduleCombatActivities) {
+    if (activity.endedAtMs !== null) {
+      endModuleCombatActivity(effectState, now);
+      continue;
+    }
     if (activity.scene !== scene) continue;
     const { sourceEntity, targetEntity } = activity;
-    if (activity.endedAtMs !== null ||
-        sourceEntity.activeModuleEffects?.get(effectState.moduleID) !== effectState ||
+    if (sourceEntity.activeModuleEffects?.get(effectState.moduleID) !== effectState ||
         scene.getEntityByID(sourceEntity.itemID) !== sourceEntity ||
         scene.getEntityByID(targetEntity.itemID) !== targetEntity) {
       endModuleCombatActivity(effectState, now);
@@ -4047,15 +4288,37 @@ function refreshModuleCombatActivities(scene, now) {
     }
     // Avoid a durable write on every subsecond simulation step. The live
     // source is checked on every step; countdowns are committed again at stop.
-    if (now - activity.lastRefreshAtMs >= 1_000 &&
-        extendModuleCombatTimers(scene, activity.participants, now)) {
-      activity.lastRefreshAtMs = now;
-      holdOngoingLimitedEngagementsForParticipants(activity.participants, now);
+    if (now - activity.lastRefreshAtMs >= COMBAT_REFRESH_INTERVAL_MS) {
+      dueActivities.push(activity);
+      for (const [characterID, participant] of activity.participants) {
+        let merged = participants.get(characterID);
+        if (!merged) {
+          merged = { entity: participant.entity, kinds: new Set() };
+          participants.set(characterID, merged);
+        }
+        for (const kind of participant.kinds) merged.kinds.add(kind);
+      }
     }
+  }
+  if (participants.size) {
+    const saved = extendModuleCombatTimers(scene, participants, now, true);
+    const pairs = new Set();
+    for (const activity of dueActivities) {
+      activity.lastRefreshAtMs = saved ? now : now + COMBAT_SAVE_RETRY_MS - COMBAT_REFRESH_INTERVAL_MS;
+      const key = [...activity.participants.keys()].sort().join(":");
+      if (!pairs.has(key)) {
+        pairs.add(key);
+        holdOngoingLimitedEngagementsForParticipants(activity.participants, now);
+      }
+    }
+  }
+  combatSaves.observedAtMs = now;
+  if (combatSaves.pending && !combatSaves.inFlight && now >= combatSaves.retryAtMs) {
+    void flushCombatRefreshes(combatSaves, now);
   }
 }
 
-function recordPvpActivity(scene, actorEntity, now = Date.now()) {
+function recordPvpActivity(scene, actorEntity, now = getWallclockNowMs()) {
   const characterID = getEntityCharacterID(actorEntity);
   const state = characterID && ensureCharacterState(characterID);
   if (!state) return { success: false, errorMsg: "CHARACTER_NOT_FOUND" };
@@ -4077,7 +4340,7 @@ function recordPvpActivity(scene, actorEntity, now = Date.now()) {
   return result;
 }
 
-function recordWeaponTimer(scene, actorEntity, now = Date.now(), options = {}) {
+function recordWeaponTimer(scene, actorEntity, now = getWallclockNowMs(), options = {}) {
   actorEntity = resolveManualStarbaseAggressor(actorEntity);
   if (!actorEntity) {
     return {
@@ -4391,7 +4654,11 @@ function recordNpcAuthorityAggression(scene, attackerEntity, targetEntity, now) 
   };
 }
 
-function recordHighSecCriminalAggression(scene, attackerEntity, targetEntity, now = Date.now()) {
+// options.sourceModuleGroupID names the group of the module that caused the
+// aggression. A module in GROUPS_SKIP_CRIMINAL_FLAGS still starts the weapon
+// and PvP timers but sets no criminal or suspect flag. Whether TQ also skips
+// those two timers for these groups needs a TQ check; the client does not say.
+function recordHighSecCriminalAggression(scene, attackerEntity, targetEntity, now = getWallclockNowMs(), options = {}) {
   attackerEntity = resolveManualStarbaseAggressor(attackerEntity);
   if (!scene || !attackerEntity || !targetEntity) {
     return {
@@ -4453,6 +4720,14 @@ function recordHighSecCriminalAggression(scene, attackerEntity, targetEntity, no
     };
   }
 
+  if (isExordiumSystem(scene.system)) {
+    return {
+      success: false,
+      errorMsg: "SafetyActivated",
+      data: { applied: false, reason: "EXORDIUM_PLAYER_AGGRESSION" },
+    };
+  }
+
   const state = ensureCharacterState(attackerCharacterID);
   if (!state) {
     return {
@@ -4479,6 +4754,19 @@ function recordHighSecCriminalAggression(scene, attackerEntity, targetEntity, no
     return combatTimerPersistence;
   }
 
+  if (GROUPS_SKIP_CRIMINAL_FLAGS.has(toPositiveInt(options && options.sourceModuleGroupID, 0))) {
+    return {
+      success: true,
+      data: {
+        applied: false,
+        reason: "MODULE_GROUP_SKIPS_CRIMINAL_FLAGS",
+        characterID: attackerCharacterID,
+        weaponTimerExpiresAtMs: state.weaponTimerExpiresAtMs,
+        pvpTimerExpiresAtMs: state.pvpTimerExpiresAtMs,
+      },
+    };
+  }
+
   const limitedEngagementLegalAggression =
     resolveLimitedEngagementLegalAggression(
       attackerCharacterID,
@@ -4492,6 +4780,11 @@ function recordHighSecCriminalAggression(scene, attackerEntity, targetEntity, no
       state,
       attackerCharacterID,
     );
+  }
+
+  if (targetProtectedPropertyCorporationID <= 0 &&
+      isLegalMilitiaAggression(attackerCharacterID, targetCharacterID)) {
+    return buildLegalMilitiaAggressionResult(state, attackerCharacterID);
   }
 
   const buildLegalCorporationFriendlyFireResult = () => ({
@@ -5141,11 +5434,19 @@ function restoreConcordResponsesForActiveCriminals(scene, now = Date.now()) {
   return restoredCount;
 }
 
-function tickScene(scene, now = Date.now()) {
+function tickScene(scene, now = getWallclockNowMs()) {
   if (!scene) {
     return;
   }
 
+  for (const [characterID, pending] of pendingAssistanceConsequences) {
+    if (pending.retryAtMs > now) continue;
+    pending.retryAtMs = now + 1_000;
+    const delivery = pending.delivery.systemID === scene.systemID ? { ...pending.delivery, scene } : pending.delivery;
+    if (applyDeliveredAssistance(delivery, now).success) {
+      pendingAssistanceConsequences.delete(characterID);
+    }
+  }
   refreshModuleCombatActivities(scene, now);
   pruneAllCharacterStates(now);
   pruneExpiredLimitedEngagements(now);
@@ -5414,6 +5715,8 @@ function hasActiveWeaponTimer(characterID, now = Date.now()) {
 }
 
 function resetCrimewatchRuntimeCacheForTests() {
+  combatSaves = { pending: false, inFlight: false, retryAtMs: 0 };
+  pendingAssistanceConsequences.clear();
   moduleCombatActivities.clear();
   characterCombatActivities.clear();
   characterCrimewatchState.clear();
@@ -5476,6 +5779,9 @@ module.exports = {
   createKillRightForCriminalAggression,
   evaluateContainerTheft,
   evaluateOffensiveAggression,
+  evaluateRemoteAssistance,
+  recordCommittedRemoteAssistance,
+  recordRemoteAssistance,
   getCharacterCrimewatchState,
   getCharacterSecurityStatus,
   getConcordResponseDelayMsForSystem,
@@ -5497,6 +5803,7 @@ module.exports = {
   recordPvpActivity,
   recordContainerTheft,
   recordHighSecCriminalAggression,
+  GROUPS_SKIP_CRIMINAL_FLAGS,
   refreshLimitedEngagementForCombat,
   refreshLimitedEngagementForCombatEntities,
   resetCrimewatchRuntimeCacheForTests,

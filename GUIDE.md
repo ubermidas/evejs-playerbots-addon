@@ -1831,7 +1831,7 @@ connection.
 
 ### Installer says the EveJS version is unsupported
 
-This release is pinned to EveJS `261115.2`. Confirm both root and
+This release is pinned to EveJS `261125.3`. Confirm both root and
 `server/package.json` versions. Do not bypass the check or force-copy the
 overlay over a different checkout. Use a matching source archive or build a
 new package with a reviewed compatibility manifest.

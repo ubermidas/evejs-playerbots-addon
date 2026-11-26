@@ -123,7 +123,9 @@ function finish(instanceID, key, options = {}) {
   journal.paidQuantity = Object.values(journal.extractionsByKey)
     .filter(value => value.status === "complete").reduce((sum, value) => sum + value.quantity, 0);
   const policy = policyFor(instance);
-  if (policy && !journal.armedAtMs && journal.paidQuantity >= policy.minimumMinedQuantity) journal.armedAtMs = intent.cycleAtMs;
+  if (policy && !journal.armedAtMs && journal.paidQuantity >= policy.minimumMinedQuantity) {
+    journal.armedAtMs = intent.deliveredAtMs ?? intent.cycleAtMs;
+  }
   const remaining = instance.spawnState?.miningRockRemainingByID || {};
   commit(instanceID, { missionMining: journal, miningRockRemainingByID: { ...remaining,
     [intent.rockID]: Math.min(remaining[intent.rockID] ?? intent.beforeState.remainingQuantity, intent.afterState.remainingQuantity),
@@ -212,25 +214,47 @@ function extract(scene, source, rock, state, cycle) {
     return { success: false, errorMsg: "MISSION_MINING_CYCLE_INVALID" };
   }
   const key = `mission-mine:${instance.instanceID}:${rock.itemID}:${source.itemID}:${cycle.moduleID}:${cycleAtMs}`;
-  let journal = clone(journalOf(instance));
+  const intent = { version: 1, status: "prepared", grantKey: key, characterID, shipID: Number(source.itemID),
+    rockID: Number(rock.itemID), dunObjectID: Number(rock.dunObjectID || rock.dungeonSourceObjectID) || null,
+    typeID: Number(state.yieldTypeID), moduleID: Number(cycle.moduleID),
+    flagID: Number(cycle.flagID), quantity, normalQuantity: Number(cycle.normalQuantity),
+    wastedQuantity: Number(cycle.wastedQuantity), criticalHitQuantity: Number(cycle.criticalHitQuantity),
+    cycleAtMs, ...(sharedIncursion ? { incursionAtMs: require("../incursion/incursionClock").now() } : {}),
+    beforeState: clone(state),
+    afterState: { ...clone(state), remainingQuantity: state.remainingQuantity - depleted, updatedAtMs: cycleAtMs } };
+  // The drone carries this intent in memory. The existing paid extraction
+  // journal starts only once the load reaches the ship.
+  if (cycle.carry === true) {
+    if (journalOf(instance).extractionsByKey?.[key]) {
+      return { success: true, duplicate: true };
+    }
+    return { success: true, data: { intent: { ...intent, instanceID: instance.instanceID } } };
+  }
+  return settleExtraction(instance, intent);
+}
+
+function deliverDroneOre(load, flagID, nowMs) {
+  const { instanceID, ...intent } = load;
+  const instance = runtime().getInstance(instanceID);
+  if (instance?.lifecycleState !== "active") {
+    return { success: false, errorMsg: "MISSION_MINING_CANCELLED" };
+  }
+  return settleExtraction(instance, { ...intent, flagID, deliveredAtMs: nowMs }, nowMs);
+}
+
+function settleExtraction(instance, intent, nowMs = intent.cycleAtMs) {
+  const key = intent.grantKey;
+  const journal = clone(journalOf(instance));
   journal.extractionsByKey ||= {};
   if (!journal.extractionsByKey[key]) {
-    if (Object.values(journal.extractionsByKey).some(intent => intent.status === "prepared")) return { success: false, errorMsg: "MISSION_MINING_EXTRACTION_PENDING" };
-    const intent = { version: 1, status: "prepared", grantKey: key, characterID, shipID: Number(source.itemID),
-      rockID: Number(rock.itemID), dunObjectID: Number(rock.dunObjectID || rock.dungeonSourceObjectID) || null,
-      typeID: Number(state.yieldTypeID), moduleID: Number(cycle.moduleID),
-      flagID: Number(cycle.flagID), quantity, normalQuantity: Number(cycle.normalQuantity),
-      wastedQuantity: Number(cycle.wastedQuantity), criticalHitQuantity: Number(cycle.criticalHitQuantity),
-      cycleAtMs, ...(sharedIncursion ? { incursionAtMs: require("../incursion/incursionClock").now() } : {}),
-      beforeState: clone(state),
-      afterState: { ...clone(state), remainingQuantity: state.remainingQuantity - depleted, updatedAtMs: cycleAtMs } };
+    if (Object.values(journal.extractionsByKey).some(value => value.status === "prepared")) {
+      return { success: false, errorMsg: "MISSION_MINING_EXTRACTION_PENDING" };
+    }
     journal.extractionsByKey[key] = intent;
-    commit(instance.instanceID, { missionMining: journal }, intent.cycleAtMs);
-  } else {
-    // Even an existing cached prepare must be durable before inventory retries.
-    commit(instance.instanceID, { missionMining: journal }, cycleAtMs);
   }
-  return finish(instance.instanceID, key, { nowMs: Number(cycle.cycleBoundaryMs) });
+  // An existing prepare may be cached after a failed durable write.
+  commit(instance.instanceID, { missionMining: journal }, nowMs);
+  return finish(instance.instanceID, key, { nowMs });
 }
 
 function beforePurge(instance) {
@@ -239,4 +263,4 @@ function beforePurge(instance) {
   if (!result.success) throw new Error(result.errorMsg);
 }
 
-module.exports = { isMissionRock, extract, reconcile, beforePurge, policyFor };
+module.exports = { isMissionRock, extract, deliverDroneOre, reconcile, beforePurge, policyFor };

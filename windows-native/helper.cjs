@@ -149,7 +149,7 @@ async function run(request) {
       request.mod?.id !== "evejs-playerbots-native") {
     throw new Error("Expected a Native EVEJS Launcher Playerbots lifecycle request.");
   }
-  if (Number(process.versions.node.split(".")[0]) < 24) throw new Error("Playerbots requires Node.js 24 or later.");
+  if (Number(process.versions.node.split(".")[0]) < 26) throw new Error("Playerbots requires Node.js 26 or later.");
   const root = fs.realpathSync(request.runtime.evejsRoot);
   const stateFile = safePath(root, stateName);
   const state = stat(stateFile) ? readJson(stateFile) : null;

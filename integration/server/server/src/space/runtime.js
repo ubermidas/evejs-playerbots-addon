@@ -639,9 +639,6 @@ const {
 require("./runtime/characterStateBridge");
 require("./runtime/squadronRuntimeBridge");
 const {
-  resolveTurretShotWithConfiguredAdditive,
-} = require("./runtime/weaponSnapshot");
-const {
   clearTrackingState,
   getStationWarpTargetPosition,
   getWarpStopDistanceForTarget,
@@ -1142,6 +1139,7 @@ runtimeExports.applySiteExplosionDamageToTarget = applySiteExplosionDamageToTarg
 runtimeExports.stopTicking = function stopTicking() {
   const result = SpaceRuntime.prototype.stopTicking.call(runtimeSingleton);
   runtimeExports._tickHandle = null;
+  require("../services/drone/droneRuntime").flushSceneDroneMotion(runtimeSingleton.scenes.values());
   return result;
 };
 // Object.assign is a one-time copy, and the tick loop writes to the singleton:
@@ -1201,9 +1199,7 @@ runtimeExports.applyResolvedEnvironmentalDamageToTarget =
   applyResolvedEnvironmentalDamageToTarget;
 runtimeExports.summarizeAbyssalBootstrapInventory = summarizeAbyssalBootstrapInventory;
 runtimeExports.droneInterop = {
-  // Drone and fighter shots resolve through the same configured additive as
-  // ship turrets; a caller passing its own hitChanceAdditive still wins.
-  resolveTurretShot: resolveTurretShotWithConfiguredAdditive,
+  resolveTurretShot,
   getCombatMessageHitQuality,
   getAppliedDamageAmount,
   notifyWeaponDamageMessages,

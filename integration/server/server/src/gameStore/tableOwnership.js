@@ -207,6 +207,10 @@ define(["crimewatchRuntime"], {
   confidence: CONFIDENCE.INFERRED,
   note: "Durable Crimewatch safety, combat-timer, and criminal/suspect flag state.",
 });
+define(["securityTagExchanges"], {
+  tier: TIERS.RUNTIME, domain: "service:security", confidence: CONFIDENCE.INFERRED,
+  note: "Pending Security Office exchanges across wallet, inventory and character status.",
+});
 define(["contractSettlements"], {
   tier: TIERS.RUNTIME,
   domain: "service:contracts",
@@ -400,14 +404,14 @@ define(["savedFittings"], {
 // ── Static · read-only SDE / reference data ──────────────────────────
 define(
   [
-    "agentAuthority", "asteroidBelts", "asteroidFieldStyles", "asteroidTypesBySolarSystemID",
-    "capitalNpcAuthority", "celestials", "characterCreationBloodlines", "characterCreationRaces",
-    "characterCreationSchools", "clientEntityStandings", "clientTypeLists", "clientShipLinkComponents", "clientMicroJumpComponents", "clientTowComponents", "clientPvpFilaments", "dbuffCollections",
+    "academyShipAuthority", "agentAuthority", "asteroidBelts", "asteroidFieldStyles", "asteroidTypesBySolarSystemID",
+    "capitalNpcAuthority", "celestials", "certificates", "characterCreationBloodlines", "characterCreationRaces",
+    "characterCreationSchools", "clientEntityStandings", "clientTypeLists", "clientShipLinkComponents", "clientMicroJumpComponents", "clientJumpBridgeComponents", "clientTowComponents", "clientPvpFilaments", "dbuffCollections",
     "dungeonAuthority", "dungeonClientContent", "dynamicItemAttributes", "evermarksCatalog", "expertSystems",
     "explorationAuthority", "explorationWormholeStatic", "factions", "fighterAbilities",
     "industryBlueprints", "industryFacilities", "itemIcons", "itemTypes", "mapTagsAuthority",
     "missionAuthority", "moonMiningPoints", "movementAttributes", "npcBehaviorProfiles",
-    "npcHostileUtilities", "npcLoadouts", "npcLootTables", "npcProfiles", "npcSpawnGroups",
+    "npcHostileUtilities", "npcLoadouts", "npcLootTables", "npcOwnerDirectory", "npcProfiles", "npcSpawnGroups",
     "npcSpawnPools", "npcStandingsAuthority", "npcStartupRules", "planetSchematics",
     "reprocessingClientRandomizedMaterials", "reprocessingStatic", "shipCosmeticsCatalog", "shipSkinComponentAuthority", "shipSkinSequencingAuthority",
     "shipSkinMarketAuthority", "shipSkinComponentListingAuthority", "shipSkinStoreAuthority",
@@ -415,7 +419,7 @@ define(
     "skillTypes", "solarSystems", "sovereigntyStatic", "stargateTypes", "stargateVisualOverrides",
     "stargates", "starterShipFittings", "stationGraphicLocators", "stationStandingsRestrictions",
     "stationTypes", "stations", "structureGraphicLocators", "structureTypes",
-    "trigDrifterSpawnAuthority", "typeDogma",
+    "trigDrifterSpawnAuthority", "typeDogma", "wreckGraphicProfiles",
   ],
   { tier: TIERS.STATIC, domain: "sde", confidence: CONFIDENCE.INFERRED,
     note: "Treated as read-only reference (not in any runtime-persisted set)." },
@@ -430,7 +434,7 @@ define(["stationDockingPlacements"], {
   tier: TIERS.STATIC,
   domain: "sde",
   confidence: CONFIDENCE.INFERRED,
-  note: "Build input only: tools/DatabaseCreator/database-creator.js reads it when it builds the stations table. The server never reads it at runtime.",
+  note: "Retired build input, classified for legacy local-data inventories. Current setup derives station geometry from client locators and rotations and never reads this table. No runtime reader or writer.",
 });
 
 // ── Query API ────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@
 // Without EVEJS_ROOT the script reports itself as skipped.
 if (!process.env.EVEJS_ROOT) {
   require("node:test").test(__filename.split(/[\\/]/).pop(), {
-    skip: "set EVEJS_ROOT to a compatible EveJS 261115.2 checkout to run this",
+    skip: "set EVEJS_ROOT to a compatible EveJS 261125.3 checkout to run this",
   }, () => {});
   return;
 }

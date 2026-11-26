@@ -1342,7 +1342,9 @@ function getFleetComposition(fleetID) {
       solarSystemID: member.solarSystemID ?? null,
       stationID: member.stationID ?? null,
       shipTypeID: member.shipTypeID ?? null,
-      skills: Array.isArray(member.skills) ? member.skills.slice(0, 3) : [0, 0, 0],
+      // The 24.02 composition window indexes three skill IDs when it receives levels.
+      // The fleet runtime has no skill IDs for this report.
+      skills: [],
       skillIDs: [],
     });
   }
@@ -1881,6 +1883,10 @@ function acceptInvite(session, fleetID, shipTypeID = null) {
   notifyFleet(fleet, "OnFleetJoin", [buildMemberPayload(member)], {
     idType: "*fleetid",
   });
+  // Fleet up: one join, receipted by the fleet, the pilot and the join time. Bookkeeping never fails the join.
+  try {
+    require("../achievement/achievementRuntime").recordFleetJoin(characterID, fleet.fleetID, member.timestamp);
+  } catch (_) { /* achievement bookkeeping is best effort */ }
   return true;
 }
 

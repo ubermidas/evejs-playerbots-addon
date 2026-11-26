@@ -148,6 +148,17 @@ const {
   broadcastStructureGuestLeft,
 } = require(path.join(__dirname, "../services/_shared/guestLists"));
 const crimewatchState = require(path.join(__dirname, "../services/security/crimewatchState"));
+const { getShipChangePursuitError } = require("../services/security/shipPursuit");
+const { isHighSecuritySystem } = require("../services/security/systemSecurity");
+const {
+  POCHVEN_HOME_CONDUIT_STANDING,
+  POCHVEN_SYSTEM_FAMILY,
+  getPochvenSystemFamily,
+  getTriglavianStandingRefusal,
+  isPochvenSystem,
+} = require("./pochvenPolicy");
+const { getNpcStationDockingRefusal } = require("./npcStationDocking");
+const { snapshotNullifierCooldowns } = require("./runtime/nullifierCooldowns");
 const worldData = require(path.join(__dirname, "./worldData"));
 const spaceRuntime = require(path.join(__dirname, "./runtime"));
 const { resolveItemByTypeID } = require("../services/inventory/itemTypeRegistry");
@@ -155,6 +166,9 @@ const {
   resetEntityMotion,
 } = require("./runtime/destinyMovementEngine");
 const { persistShipEntity } = require("./runtime/entitySpacePersistence");
+const { getDockedShipCapacitorRatio } = require("./runtime/entityCapacitor");
+const { buildUnpilotedShipResourceState } = require("./runtime/shipEntity");
+const { broadcastDamageStateChange } = require("./runtime/shipHealthState");
 const {
   buildObserverStargateJumpFxOptions,
 } = require("./runtime/staticSceneEntity");
@@ -204,6 +218,8 @@ const STARGATE_JUMP_HANDOFF_RECHECK_MAX_DELAY_MS = 1000;
 // tick that sends the JumpOut, so the wake never delays the JumpOut itself.
 // The handoff then only attaches, as TQ's arrival does after its hold.
 const STARGATE_JUMP_DESTINATION_PREWARM_AFTER_JUMPOUT_MS = 250;
+const STARGATE_JUMP_DESTINATION_RETRY_DELAY_MS = 500;
+const STARGATE_JUMP_DESTINATION_MAX_ATTEMPTS = 3;
 const STARGATE_JUMP_RANGE_METERS = 2500;
 // Retail drops an arrival at a random spot the same fixed distance out from
 // the gate's hull, so a fleet in matching hulls does not stack on one point.
@@ -235,7 +251,8 @@ const DOCKED_SHIP_CONTENT_REFRESH_FLAGS = new Set([
   ITEM_FLAGS.MOBILE_DEPOT_HOLD,
   ...SPECIAL_SHIP_HOLD_FLAGS,
 ]);
-const SCRIPTED_HIC_STARGATE_BLOCKED_GROUP_IDS = new Set([
+// Freighters and jump freighters are outside these capital gate restrictions.
+const RESTRICTED_CAPITAL_GATE_GROUP_IDS = new Set([
   30, // Titan
   485, // Dreadnought
   547, // Carrier
@@ -244,10 +261,6 @@ const SCRIPTED_HIC_STARGATE_BLOCKED_GROUP_IDS = new Set([
   1538, // Force Auxiliary
   4594, // Lancer Dreadnought
   5120, // Command Carrier
-]);
-const SCRIPTED_HIC_STARGATE_EXEMPT_GROUP_IDS = new Set([
-  513, // Freighter
-  902, // Jump Freighter
 ]);
 const BOARDED_CAPSULE_REMOVED_JUNK_LOCATION_ID = 10;
 
@@ -270,27 +283,20 @@ function getCrimewatchReferenceMs(session) {
   return Date.now();
 }
 
-function isScriptedHicStargateBlockedShip(ship) {
-  const typeID = toInt(ship && ship.typeID, 0);
-  const groupID = toInt(ship && ship.groupID, 0);
-  if (typeID === TYPE_ORCA) {
-    return false;
-  }
-  if (SCRIPTED_HIC_STARGATE_EXEMPT_GROUP_IDS.has(groupID)) {
-    return false;
-  }
-  return SCRIPTED_HIC_STARGATE_BLOCKED_GROUP_IDS.has(groupID);
+function isRestrictedCapitalForGate(ship) {
+  return toInt(ship.typeID, 0) !== TYPE_ORCA &&
+    RESTRICTED_CAPITAL_GATE_GROUP_IDS.has(toInt(ship.groupID, 0));
 }
 
-function topOffShipShieldAndCapacitorForDockingTransition(shipId) {
-  return updateShipItem(shipId, (currentShip) => ({
-    ...currentShip,
-    conditionState: normalizeShipConditionState({
-      ...(currentShip.conditionState || {}),
-      charge: 1.0,
-      shieldCharge: 1.0,
-    }),
-  }));
+function getUndockingCapacitorRatio(characterID, shipItem) {
+  if (!shipItem.dockedCapacitorStartedAtMs || shipItem.conditionState.charge >= 1) {
+    return shipItem.conditionState.charge;
+  }
+  const { buildShipResourceState } = require("../services/fitting/liveFittingState");
+  const resources = buildShipResourceState(characterID, shipItem);
+  return getDockedShipCapacitorRatio(
+    shipItem, resources.capacitorCapacity, resources.capacitorRechargeRate,
+  );
 }
 
 function deactivateActiveModulesForSpaceTransition(session, reason) {
@@ -1881,6 +1887,9 @@ function completeStargateJump(
   const sourceClockCapturedAtWallclockMs = Date.now();
 
   deactivateActiveModulesForSpaceTransition(session, "stargate-jump");
+  const nullifierCooldowns = snapshotNullifierCooldowns(
+    spaceRuntime.getEntity(session, activeShip.itemID), { detached: true },
+  );
   sendMachoObjectDisconnects(session, SERVICES_LET_GO_AT_A_MOVE);
   // the source gate's Departure, to the pilots on its grid (the jumping pilot
   // leaves the scene before the bubble batch goes out, so not to it)
@@ -1900,7 +1909,7 @@ function completeStargateJump(
     speedFraction: 0,
     mode: "STOP",
     targetPoint: spawnState.position,
-  }, preparedArrival.identity);
+  }, preparedArrival.identity, { nullifierCooldowns });
   if (!moveResult.success && moveResult.mutationResult?.success) {
     // The inventory command may have committed before its acknowledgement was
     // lost. Preserve the exact native move result; reconciliation reads its
@@ -1961,7 +1970,7 @@ function completeStargateJump(
     return applyResult;
   }
 
-  spaceRuntime.attachSession(session, moveResult.data, {
+  const attachedShip = spaceRuntime.attachSession(session, moveResult.data, {
     systemID: destinationGate.solarSystemID,
     beyonceBound: false,
     pendingUndockMovement: false,
@@ -1976,6 +1985,10 @@ function completeStargateJump(
     deferUniverseSiteReconcile: true,
     universeSiteReconcileReason: "stargate-jump",
   });
+  if (!attachedShip) {
+    endTransition(session, "stargate-jump");
+    return { success: false, errorMsg: "STARGATE_DESTINATION_ATTACH_FAILED" };
+  }
   const observerArrivalFxResult = spaceRuntime.emitStargateArrivalObserverFx(
     session,
     destinationGate.itemID,
@@ -2075,6 +2088,38 @@ function completeStargateJump(
   };
 }
 
+function createStargateDestinationCheck(systemID) {
+  let attempts = 0;
+  return () => {
+    attempts += 1;
+    try {
+      if (!spaceRuntime.isSolarSystemSceneLoaded(systemID) && !spaceRuntime.ensureScene(systemID)) {
+        throw new Error("STARGATE_DESTINATION_UNAVAILABLE");
+      }
+      return 0;
+    } catch (error) {
+      const retryableSaveFailure = error.code === "DYNAMIC_RESOURCE_FLUSH_ERROR" ||
+        (error.orbitalPositionMigration && error.code === "FLUSH_ERROR");
+      if (!retryableSaveFailure || attempts >= STARGATE_JUMP_DESTINATION_MAX_ATTEMPTS) throw error;
+      log.warn(`[SpaceTransition] Retrying stargate destination system=${systemID} after attempt ${attempts}: ${error.message}`);
+      return STARGATE_JUMP_DESTINATION_RETRY_DELAY_MS;
+    }
+  };
+}
+
+function createStargateClientRecovery(session, transitionState) {
+  const sourceSocket = session.socket;
+  const characterID = session.characterID;
+  return () => {
+    if (session.socket !== sourceSocket || session.characterID !== characterID ||
+        (session._transitionState && session._transitionState !== transitionState)) return;
+    if (session._transitionState === transitionState) endTransition(session, "stargate-jump");
+    if (sourceSocket && !sourceSocket.destroyed && typeof sourceSocket.destroy === "function") {
+      sourceSocket.destroy();
+    }
+  };
+}
+
 function scheduleStargateJumpHandoff(
   session,
   sourceGate,
@@ -2085,9 +2130,15 @@ function scheduleStargateJumpHandoff(
   sourceSpaceGeneration,
   handoffDeadline,
 ) {
+  const sourceSocket = session.socket;
+  const characterID = session.characterID;
+  const checkDestination = createStargateDestinationCheck(destinationGate.solarSystemID);
+  const recoverClient = createStargateClientRecovery(session, transitionState);
   const hasExpectedAuthority = () =>
     Boolean(
       session &&
+      session.socket === sourceSocket &&
+      session.characterID === characterID &&
       session._space === sourceSpaceGeneration &&
       session._transitionState === transitionState,
     );
@@ -2120,7 +2171,7 @@ function scheduleStargateJumpHandoff(
       log.warn(
         `[SpaceTransition] Cancelling stargate jump for ${session.characterName || session.characterID}: source simulation clock is unavailable`,
       );
-      cancelExpectedTransition();
+      recoverClient();
       return;
     }
     const remainingSimulationMs = Math.max(
@@ -2147,17 +2198,30 @@ function scheduleStargateJumpHandoff(
         },
       );
     }
-    const completionResult = completeStargateJump(
-      session,
-      sourceGate,
-      destinationGate,
-      activeShip,
-    );
-    if (!completionResult.success) {
+    try {
+      const retryDelayMs = checkDestination();
+      if (retryDelayMs) {
+        setTimeout(attemptHandoff, retryDelayMs);
+        return;
+      }
+    } catch (error) {
+      log.warn(`[SpaceTransition] Stargate destination unavailable system=${destinationGate.solarSystemID}: ${error.message}`);
+      recoverClient();
+      return;
+    }
+
+    try {
+      const result = completeStargateJump(session, sourceGate, destinationGate, activeShip);
+      if (result.success) return;
       log.warn(
-        `[SpaceTransition] Delayed stargate jump failed for ${session.characterName || session.characterID}: ${completionResult.errorMsg}`,
+        `[SpaceTransition] Delayed stargate jump failed for ${session.characterName || session.characterID}: ${result.errorMsg}`,
+      );
+    } catch (error) {
+      log.warn(
+        `[SpaceTransition] Delayed stargate jump threw for ${session.characterName || session.characterID}: ${error.stack || error.message}`,
       );
     }
+    recoverClient();
   };
 
   const initialSessionSimTimeMs = sourceScene.getCurrentSessionSimTimeMs(session);
@@ -2357,6 +2421,9 @@ function undockSession(session, options = {}) {
       errorMsg: "SHIP_NOT_FOUND",
     };
   }
+  if (require("../services/faction/factionWarfareAuthority").isDockableAccessRestricted(
+    session.characterID, activeShip, dockable.solarSystemID,
+  )) return { success: false, errorMsg: "FW_OCCUPATION_ACCESS_DENIED" };
   const strategicCruiserUseError = getStrategicCruiserTransitionUseError(
     session.characterID,
     activeShip,
@@ -2431,16 +2498,12 @@ function undockSession(session, options = {}) {
       mode: "STOP",
       targetPoint: undockState.position,
       customInfo: `Undocking:${dockedLocationID}`,
+    }, {
+      charge: getUndockingCapacitorRatio(session.characterID, activeShip),
+      shieldCharge: 1,
     });
     if (!moveResult.success) {
       return moveResult;
-    }
-
-    const restoreResult = topOffShipShieldAndCapacitorForDockingTransition(
-      moveResult.data.itemID,
-    );
-    if (restoreResult && restoreResult.success) {
-      moveResult.data = restoreResult.data;
     }
 
     const itemChangeData = dockable.kind === "structure"
@@ -2604,6 +2667,10 @@ function dockSession(session, stationID) {
     };
   }
 
+  if (require("../services/faction/factionWarfareAuthority").isDockableAccessRestricted(
+    session.characterID, activeShip, dockable.solarSystemID,
+  )) return { success: false, errorMsg: "FW_OCCUPATION_ACCESS_DENIED" };
+
   if (crimewatchState.isCriminallyFlagged(session.characterID, getCrimewatchReferenceMs(session))) {
     return {
       success: false,
@@ -2630,6 +2697,9 @@ function dockSession(session, stationID) {
     if (!dockCheck.success) {
       return dockCheck;
     }
+  } else {
+    const npcRefusal = getNpcStationDockingRefusal(session.characterID, dockable.record, activeShip);
+    if (npcRefusal) return npcRefusal;
   }
 
   if (!beginTransition(session, "dock", targetStationID)) {
@@ -2641,6 +2711,9 @@ function dockSession(session, stationID) {
 
   try {
     deactivateActiveModulesForSpaceTransition(session, "dock");
+    const nullifierCooldowns = snapshotNullifierCooldowns(
+      spaceRuntime.getEntity(session, activeShip.itemID), { detached: true },
+    );
     clearPendingUndockInvulnerability(session);
     sendInvulnerabilityCancelled(session, activeShip.itemID);
     sendMachoObjectDisconnects(session, SERVICES_LET_GO_AT_A_MOVE);
@@ -2650,17 +2723,13 @@ function dockSession(session, stationID) {
       notifySelfOnTargetClear: true,
     });
 
-    const dockResult = dockShipToLocation(activeShip.itemID, dockable.locationID);
+    const dockResult = dockShipToLocation(activeShip.itemID, dockable.locationID, {
+      capacitorStartedAtMs: Date.now(),
+      nullifierCooldowns,
+    });
     if (!dockResult.success) {
       return dockResult;
     }
-    const topOffResult = topOffShipShieldAndCapacitorForDockingTransition(
-      dockResult.data.itemID,
-    );
-    if (topOffResult && topOffResult.success) {
-      dockResult.data = topOffResult.data;
-    }
-
     syncDockedShipTransitionForSession(session, dockResult, {
       locationContext: buildDockedShipLocationContext(dockable.kind, dockable.locationID),
       refreshActiveShip: false,
@@ -2728,6 +2797,14 @@ function consumeEmergencyWarpReturnStateForLogin(activeShip, characterID) {
 
   const returnState = getEmergencyWarpReturnState(activeShip.spaceState);
   if (!returnState) {
+    return activeShip;
+  }
+
+  const scene = spaceRuntime.getSceneByDescriptor(returnState.systemID);
+  const retained = scene?.getEntityByID(activeShip.itemID);
+  if (retained?.session?.ordinaryLogoff &&
+      Number(retained.session.characterID) === Number(characterID)) {
+    // A warm reconnect takes custody of the live ball and flies its return.
     return activeShip;
   }
 
@@ -2905,6 +2982,7 @@ function restoreSpaceSession(session) {
   if (!activeShip || !activeShip.spaceState) {
     return false;
   }
+  const hasEmergencyReturn = Boolean(getEmergencyWarpReturnState(activeShip.spaceState));
   activeShip = consumeEmergencyWarpReturnStateForLogin(
     activeShip,
     session.characterID,
@@ -2917,6 +2995,7 @@ function restoreSpaceSession(session) {
       session.solarsystemid ||
       session.solarsystemid2,
     pendingUndockMovement: false,
+    skipLegacyStationNormalization: hasEmergencyReturn,
     broadcast: true,
     emitSimClockRebase: false,
     deferUniverseSiteReconcile: true,
@@ -2997,6 +3076,41 @@ function restoreSpaceSession(session) {
 const SHIP_DESTRUCTION_MODULE_COMMITMENT_BYPASS = Symbol(
   "shipDestructionModuleCommitmentBypass",
 );
+const EJECT_FOR_MAINTENANCE_STORAGE = Symbol("ejectForMaintenanceStorage");
+
+function settleAbandonedShipStructure(session, scene, entity, shipItem) {
+  const previousHP = toFiniteNumber(entity.structureHP, 0);
+  const nextHP = buildUnpilotedShipResourceState(shipItem, scene.systemID)?.structureHP;
+  if (previousHP <= 0 || !(nextHP > 0) || previousHP === nextHP) {
+    return;
+  }
+
+  const condition = normalizeShipConditionState(entity.conditionState);
+  const damage = previousHP * condition.damage;
+  if (damage > nextHP) {
+    const { destroyShipEntityWithWreck } = require("./shipDestruction");
+    const result = destroyShipEntityWithWreck(scene.systemID, entity, {
+      scene,
+      ownerCharacterID: session.characterID,
+      lootOwnerSession: session,
+      shipRecord: shipItem,
+      forceVisibleSessions: [session],
+    });
+    if (result.success) {
+      syncInventoryChangesToSession(session, [
+        ...result.data.movedChanges,
+        ...result.data.destroyChanges,
+      ]);
+      return;
+    }
+    log.warn(`[SpaceTransition] Abandoned ship=${entity.itemID} destruction failed: ${result.errorMsg}`);
+  }
+
+  entity.structureHP = nextHP;
+  entity.conditionState = { ...condition, damage: damage / nextHP };
+  persistShipEntity(entity);
+  broadcastDamageStateChange(scene, entity);
+}
 
 function ejectSession(session, options = {}) {
   if (options[SHIP_DESTRUCTION_ABYSSAL_TRANSITION_BYPASS] !== true) {
@@ -3071,6 +3185,13 @@ function ejectSession(session, options = {}) {
   }
 
   try {
+    if (options[SHIP_DESTRUCTION_ABYSSAL_TRANSITION_BYPASS] !== true) {
+      const pursuitError = getShipChangePursuitError(scene, currentEntity, "eject");
+      if (pursuitError) return pursuitError;
+      if (crimewatchState.hasActiveWeaponTimer(session.characterID)) {
+        return { success: false, errorMsg: "WEAPONS_TIMER_ACTIVE" };
+      }
+    }
     const beforeSameSceneShipSwapNotificationPlanFlush =
       typeof options.beforeSameSceneShipSwapNotificationPlanFlush === "function"
         ? options.beforeSameSceneShipSwapNotificationPlanFlush
@@ -3203,7 +3324,7 @@ function ejectSession(session, options = {}) {
       };
     }
 
-    if (session._abyssalOfflineSession !== true) {
+    if (session._abyssalOfflineSession !== true && !session.ordinaryLogoff) {
       queuePostSpaceAttachFittingHydration(session, capsuleMoveResult.data.itemID, {
         inventoryBootstrapPending: false,
         hydrationProfile: "capsule",
@@ -3270,6 +3391,13 @@ function ejectSession(session, options = {}) {
       );
     }
 
+    if (
+      options[SHIP_DESTRUCTION_MODULE_COMMITMENT_BYPASS] !== true &&
+      options[EJECT_FOR_MAINTENANCE_STORAGE] !== true
+    ) {
+      settleAbandonedShipStructure(session, scene, abandonedShipEntity, activeShip);
+    }
+
     log.info(
       `[SpaceTransition] Ejected ${session.characterName || session.characterID} from ship=${activeShip.itemID} into capsule=${capsuleMoveResult.data.itemID} system=${currentSystemID}`,
     );
@@ -3285,6 +3413,12 @@ function ejectSession(session, options = {}) {
   } finally {
     endTransition(session, "eject");
   }
+}
+
+function ejectSessionForMaintenanceStorage(session) {
+  // Storage owns the hull after the pilot leaves it, including recovery if
+  // the inventory move fails. Keep it intact for either outcome.
+  return ejectSession(session, { [EJECT_FOR_MAINTENANCE_STORAGE]: true });
 }
 
 function ejectSessionForShipDestruction(session, options = {}) {
@@ -3319,7 +3453,7 @@ function isTargetLockedByAnotherPlayer(scene, targetEntity, boardingCharacterID)
   return false;
 }
 
-function boardSpaceShip(session, shipID) {
+function boardSpaceShip(session, shipID, { abandonCurrentHull = false } = {}) {
   const deathRestriction = buildShipDeathTransitionBlockedResult(session);
   if (deathRestriction) return deathRestriction;
   if (!session || !session.characterID || !session._space) {
@@ -3471,6 +3605,9 @@ function boardSpaceShip(session, shipID) {
   }
 
   try {
+    const pursuitError = getShipChangePursuitError(scene, currentEntity, "board");
+    if (pursuitError) return pursuitError;
+
     const currentSystemID = Number(scene.systemID || session.solarsystemid2 || session.solarsystemid || 0);
     const preservedSpaceState = captureSpaceSessionState(session);
     const inheritedPlayerEgoScopeState =
@@ -3593,9 +3730,8 @@ function boardSpaceShip(session, shipID) {
         errorMsg: "BOARD_ATTACH_FAILED",
       };
     }
-    // An unpiloted hull carries its raw type envelope. Apply fitted modules
-    // and pilot skills before the SetState is built, so the client never sees
-    // raw max-speed/agility values and then a later hydration correction.
+    // Apply the boarding pilot's skills before SetState so the client gets
+    // the new max speed and agility with the pilot change.
     // Every other Observer already has the hull with its old values: the new
     // mass, agility and max speed go to its Grid bubble history when they
     // apply, on the stamp of the pilot change, the pilot included.
@@ -3609,6 +3745,7 @@ function boardSpaceShip(session, shipID) {
           notifyTargeting: false,
           notifyDerivedAttributes: false,
           notifyGenericModuleAttributes: false,
+          preserveStructureDamage: boardedEntity.structureDamageBasisKnown === true,
           shipPrimeBroadcast: (previousState) => scene.broadcastShipPrimeUpdates(
             boardedEntity,
             { previousState },
@@ -3684,6 +3821,8 @@ function boardSpaceShip(session, shipID) {
           errorMsg: "CAPSULE_REMOVAL_DELIVERY_FAILED",
         };
       }
+    } else if (abandonCurrentHull) {
+      settleAbandonedShipStructure(session, scene, abandonedCurrentEntity, currentShip);
     }
 
     // The boarded ship's new slim item (its pilot) and its interactive flag
@@ -3706,7 +3845,11 @@ function boardSpaceShip(session, shipID) {
     return {
       success: true,
       data: {
-        ship: targetShip,
+        ship: {
+          ...targetShip,
+          conditionState: normalizeShipConditionState(boardedEntity.conditionState),
+          structureDamageBasisHP: boardedEntity.structureHP,
+        },
         previousShip: currentShip,
         boundResult: buildBoundResult(session),
       },
@@ -3753,7 +3896,7 @@ function scheduleStargateDestinationPrewarm(
         reason: "stargate-arrival-prewarm",
       });
     } catch (error) {
-      // The handoff's own attach still wakes the system.
+      // The handoff checks destination readiness again before moving the ship.
       log.warn(
         `[SpaceTransition] Stargate destination prewarm failed system=${destinationGate.solarSystemID}: ${error.message}`,
       );
@@ -3836,6 +3979,20 @@ function jumpSessionViaStargate(session, fromStargateID, toStargateID) {
     };
   }
 
+  // An AIR Academy ship does not leave academy space: the client's gate check
+  // skips its leave-starter-space dialog for one, so the server stops the jump
+  // and sends the travel decline (services/academyShip/academyShipExit.js).
+  if (require("../services/academyShip/academyShipExit").declineStargateTravel(
+    session,
+    destinationGate.solarSystemID,
+  )) {
+    endTransition(session, "stargate-jump");
+    return {
+      success: false,
+      errorMsg: "ACADEMY_SHIP_TRAVEL_DECLINED",
+    };
+  }
+
   if (crimewatchState.isCriminallyFlagged(session.characterID, getCrimewatchReferenceMs(session))) {
     endTransition(session, "stargate-jump");
     return {
@@ -3856,9 +4013,10 @@ function jumpSessionViaStargate(session, fromStargateID, toStargateID) {
   }
 
   const shipEntity = spaceRuntime.getEntity(session, activeShip.itemID);
+  const restrictedCapital = isRestrictedCapitalForGate(activeShip);
   if (
     shipEntity &&
-    isScriptedHicStargateBlockedShip(activeShip) &&
+    restrictedCapital &&
     hostileModuleRuntime.hasScriptedHicGateScramble(shipEntity)
   ) {
     endTransition(session, "stargate-jump");
@@ -3877,6 +4035,29 @@ function jumpSessionViaStargate(session, fromStargateID, toStargateID) {
         success: false,
         errorMsg: "TOO_FAR_FROM_STARGATE",
       };
+    }
+  }
+
+  const destinationSystem = worldData.getSolarSystemByID(destinationGate.solarSystemID);
+  if (restrictedCapital && isHighSecuritySystem(destinationSystem)) {
+    endTransition(session, "stargate-jump");
+    return {
+      success: false,
+      errorMsg: "CAPITAL_STARGATE_HIGHSEC_DESTINATION",
+      data: { typeID: Number(activeShip.typeID) },
+    };
+  }
+
+  if (
+    !transientRoute &&
+    isPochvenSystem(destinationGate.solarSystemID, destinationSystem) &&
+    getPochvenSystemFamily(destinationSystem.solarSystemName) === POCHVEN_SYSTEM_FAMILY.HOME &&
+    isPochvenSystem(sourceGate.solarSystemID)
+  ) {
+    const refusal = getTriglavianStandingRefusal(session.characterID, POCHVEN_HOME_CONDUIT_STANDING);
+    if (refusal) {
+      endTransition(session, "stargate-jump");
+      return { success: false, errorMsg: "POCHVEN_CONDUIT_STANDINGS_TOO_LOW", data: refusal };
     }
   }
 
@@ -3960,9 +4141,18 @@ function jumpSessionViaStargate(session, fromStargateID, toStargateID) {
     const accepted = require("./transientStargates").scheduleJump(transientRoute, {
       session, ship: shipEntity, characterID: session.characterID,
       transition: transitionState, spaceGeneration: sourceSpaceGeneration,
+      socket: session.socket,
       deadlineSimTimeMs: handoffDeadline.deadlineSimTimeMs,
+      checkDestination: createStargateDestinationCheck(destinationGate.solarSystemID),
+      recoverClient: createStargateClientRecovery(session, transitionState),
       cancel() {
-        if (session._transitionState === transitionState) endTransition(session, "stargate-jump");
+        if (session._transitionState !== transitionState) return;
+        if (this.retryAtMs !== undefined && session._space === sourceSpaceGeneration &&
+            session.socket === this.socket && session.characterID === this.characterID) {
+          this.recoverClient();
+        } else {
+          endTransition(session, "stargate-jump");
+        }
       },
       complete() {
         if (transientRoute.destinationGate) {
@@ -4257,7 +4447,7 @@ function rebuildDockedSessionAtStation(session, stationID, options = {}) {
     );
   }
 
-  if (session._abyssalOfflineSession !== true) {
+  if (session._abyssalOfflineSession !== true && !session.ordinaryLogoff) {
     queuePendingSessionEffects(session, {
       previousLocalChannelID,
     });
@@ -4848,8 +5038,12 @@ function jumpSessionToSolarSystem(session, solarSystemID, options = {}) {
       };
     }
 
+    let nullifierCooldowns;
     if (wasInSpace) {
       deactivateActiveModulesForSpaceTransition(session, "solar-jump");
+      nullifierCooldowns = snapshotNullifierCooldowns(
+        spaceRuntime.getEntity(session, activeShip.itemID), { detached: true },
+      );
       spaceRuntime.detachSession(session, {
         broadcast: true,
         lifecycleReason: "solar-jump",
@@ -4872,8 +5066,8 @@ function jumpSessionToSolarSystem(session, solarSystemID, options = {}) {
         : {}),
     };
     const moveResult = replayTransfer
-      ? moveShipToSpaceIdempotent(activeShip.itemID, targetSolarSystemID, targetSpaceState, replayTransfer)
-      : moveShipToSpace(activeShip.itemID, targetSolarSystemID, targetSpaceState);
+      ? moveShipToSpaceIdempotent(activeShip.itemID, targetSolarSystemID, targetSpaceState, replayTransfer, { nullifierCooldowns })
+      : moveShipToSpace(activeShip.itemID, targetSolarSystemID, targetSpaceState, undefined, { nullifierCooldowns });
     if (!moveResult.success) {
       return moveResult;
     }
@@ -5333,6 +5527,7 @@ module.exports = {
   dockSession,
   restoreSpaceSession,
   ejectSession,
+  ejectSessionForMaintenanceStorage,
   ejectSessionForShipDestruction,
   boardSpaceShip,
   getStrategicCruiserTransitionUseError,

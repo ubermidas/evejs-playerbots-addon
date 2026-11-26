@@ -19,6 +19,9 @@ const CHARACTER_PORTRAIT_TYPES = new Set(["image/jpeg", "image/png"]);
 const SHIP_RENDER_CACHE_MS = 6 * 60 * 60 * 1000;
 const MIN_DASHBOARD_API_TIMEOUT_MS = 10_000;
 const MAX_DASHBOARD_API_TIMEOUT_MS = 30_000;
+const DEFAULT_READ_CACHE_MS = 2_000;
+// Tells EveJS when the dashboard stops waiting for a read (epoch milliseconds).
+const DEADLINE_HEADER = "x-playerbots-deadline";
 
 function positiveInteger(value, fallback, maximum) {
   const parsed = Math.trunc(Number(value));
@@ -50,6 +53,7 @@ function createDashboardServer(options = {}) {
   const staticRoot = options.staticRoot || STATIC_ROOT;
   const logger = options.logger || { info() {}, warn() {} };
   const shipRenderCache = new Map();
+  const readCacheMs = positiveInteger(options.readCacheMs ?? process.env.EVEJS_PLAYER_BOTS_DASHBOARD_CACHE_MS, DEFAULT_READ_CACHE_MS, 30_000);
   let server = null;
 
   function proxyTimeoutMs() {
@@ -81,25 +85,65 @@ function createDashboardServer(options = {}) {
     response.end(body);
   }
 
-  async function proxyApi(response, pathname, query = "") {
-    const startedAtMs = Date.now();
+  // Every open page polls on a timer, and each view asks for the summary and
+  // its own data. Identical reads that arrive together share one request to
+  // EveJS, and a successful answer is reused for a moment, so two tabs or a
+  // page and the watch panel do not multiply the work the game server does.
+  const readCache = new Map();
+  let readGeneration = 0;
+
+  function invalidateReads() {
+    readGeneration += 1;
+    readCache.clear();
+  }
+
+  function fetchRead(target) {
+    const now = Date.now();
+    const cached = readCache.get(target);
+    if (cached && (cached.pending || now - cached.at < readCacheMs)) return cached.pending || Promise.resolve(cached.result);
+    const generation = readGeneration;
+    const startedAtMs = now;
     const timeoutMs = proxyTimeoutMs();
-    try {
-      const upstream = await fetchImpl(`${apiURL}${pathname}${query}`, {
-        method: "GET",
-        headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-        signal: timeoutSignal(timeoutMs),
-      });
-      const body = Buffer.from(await upstream.arrayBuffer());
-      if (body.length > MAX_PROXY_BYTES) {
-        send(response, 502, "application/json; charset=utf-8", JSON.stringify({ error: "Dashboard response exceeded its size limit." }));
-        return;
+    const entry = { at: now, result: null, pending: null };
+    entry.pending = (async () => {
+      try {
+        const upstream = await fetchImpl(`${apiURL}${target}`, {
+          method: "GET",
+          headers: {
+            authorization: `Bearer ${token}`,
+            accept: "application/json",
+            // EveJS skips the work for a read nobody is still waiting for.
+            [DEADLINE_HEADER]: String(startedAtMs + timeoutMs),
+          },
+          signal: timeoutSignal(timeoutMs),
+        });
+        const body = Buffer.from(await upstream.arrayBuffer());
+        if (body.length > MAX_PROXY_BYTES) {
+          return { status: 502, body: Buffer.from(JSON.stringify({ error: "Dashboard response exceeded its size limit." })) };
+        }
+        return { status: upstream.status, body };
+      } catch (error) {
+        logger.warn(`[PlayerBotsDashboard] Private API request failed after ${Date.now() - startedAtMs}ms (timeout=${timeoutMs}ms): ${String(error && error.message || error).slice(0, 180)}`);
+        return { status: 503, body: Buffer.from(JSON.stringify({ error: "PLAYERBOTS_DASHBOARD_BUSY" })) };
       }
-      send(response, upstream.status, "application/json; charset=utf-8", body);
-    } catch (error) {
-      logger.warn(`[PlayerBotsDashboard] Private API request failed after ${Date.now() - startedAtMs}ms (timeout=${timeoutMs}ms): ${String(error && error.message || error).slice(0, 180)}`);
-      send(response, 503, "application/json; charset=utf-8", JSON.stringify({ error: "EveJS dashboard data is temporarily unavailable." }));
-    }
+    })().then((result) => {
+      entry.pending = null;
+      entry.at = Date.now();
+      entry.result = result;
+      // Only successful answers are reused; a failure is retried at once.
+      if (result.status !== 200 || generation !== readGeneration || readCacheMs <= 0) {
+        if (readCache.get(target) === entry) readCache.delete(target);
+      }
+      return result;
+    });
+    readCache.set(target, entry);
+    if (readCache.size > 256) readCache.delete(readCache.keys().next().value);
+    return entry.pending;
+  }
+
+  async function proxyApi(response, pathname, query = "") {
+    const result = await fetchRead(`${pathname}${query}`);
+    send(response, result.status, "application/json; charset=utf-8", result.body);
   }
 
   async function proxyMutation(response, pathname, method, body) {
@@ -117,6 +161,8 @@ function createDashboardServer(options = {}) {
         signal: timeoutSignal(timeoutMs),
       });
       const payload = Buffer.from(await upstream.arrayBuffer());
+      // An order changes what the next read should show.
+      invalidateReads();
       if (payload.length > MAX_PROXY_BYTES) {
         send(response, 502, "application/json; charset=utf-8", JSON.stringify({ error: "Dashboard response exceeded its size limit." }));
         return;

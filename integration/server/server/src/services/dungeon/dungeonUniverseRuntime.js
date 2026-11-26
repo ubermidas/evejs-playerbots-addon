@@ -17,9 +17,11 @@ const { isVoidSystemID } = require("../../space/voidSystemRange");
 const dungeonAuthority = require(path.join(__dirname, "./dungeonAuthority"));
 const homefrontPopulationPolicy = require("./homefrontPopulationPolicy");
 const dungeonRuntime = require(path.join(__dirname, "./dungeonRuntime"));
+const { hashValue, hashText, computeTemplateContentHash } = require("./dungeonTemplateContentHash");
 const dungeonSiteAdapter = require(path.join(__dirname, "./dungeonSiteAdapter"));
 const dungeonSiteSpawnPolicy = require(path.join(__dirname, "./dungeonSiteSpawnPolicy"));
 const dungeonRuntimeState = require(path.join(__dirname, "./dungeonRuntimeState"));
+const { isNativeInsurgencyTemplate } = require("./pirateInsurgencyArchetypes");
 const {
   getSovProspectingRepairTemplateName,
   isValidSovProspectingClientNameTemplate,
@@ -452,23 +454,6 @@ function normalizeProvidedSystemIDs(systemIDs = []) {
     .filter((entry) => entry > 0))].sort((left, right) => left - right);
 }
 
-function hashValue(value) {
-  let state = toInt(value, 0) >>> 0;
-  state = Math.imul(state ^ (state >>> 16), 0x45d9f3b);
-  state = Math.imul(state ^ (state >>> 16), 0x45d9f3b);
-  state ^= state >>> 16;
-  return state >>> 0;
-}
-
-function hashText(value) {
-  const normalized = normalizeText(value, "");
-  let state = 0;
-  for (let index = 0; index < normalized.length; index += 1) {
-    state = hashValue(state + normalized.charCodeAt(index));
-  }
-  return state >>> 0;
-}
-
 function clonePosition(position, fallback = { x: 0, y: 0, z: 0 }) {
   return {
     x: toFiniteNumber(position && position.x, fallback.x),
@@ -844,6 +829,7 @@ function listCompiledSpawnFamilies() {
       tuningByBand,
       regionSiteCountMultipliers: normalizeRegionSiteCountMultipliers(profile.regionSiteCountMultipliers),
       systemSpawnChance: normalizeSystemSpawnChance(profile.systemSpawnChance),
+      fwPlacement: profile.fwPlacement || null,
       homefrontSystemIDs: homefrontPopulationPolicy.operationType(family) ? profile.systemIDs || [] : [],
       lifetimeMs: resolveSiteLifetimeMs(profile.siteLifetimeMinutes),
     });
@@ -875,8 +861,14 @@ function resolveSystemSitePlan(systemID, options = {}) {
     .filter(Boolean));
   const band = getSecurityBand(numericSystemID);
   const plan = [];
-  for (const entry of listCompiledSpawnFamilies()) {
-    if (["gallente_fw_open","caldari_fw_open"].includes(entry.family) && !require("../seasons/campaignTrailCatalog").isEnabled()) continue;
+  const { SPAWN_FACTIONS } = require("../faction/fwOpenModel");
+  const empireWarzone = require("../faction/fwTerritoryCatalog").getNativeFactionID(numericSystemID) !== null;
+  const families = listCompiledSpawnFamilies();
+  const hasSizeSlots = families.some(entry => entry.fwPlacement?.size);
+  let fwSystem;
+  for (const entry of families) {
+    if (empireWarzone && ["combat_anomaly", "drone_anomaly"].includes(entry.family)) continue;
+    if (hasSizeSlots && Object.hasOwn(SPAWN_FACTIONS, entry.family)) continue;
     if (entry.family === "gallente_fabricator" && !require("../seasons/eventHooks").fabricator.isAvailable(numericSystemID)) continue;
     if (entry.family === "gallente_iteration_depot" &&
         (!require("../seasons/campaignTrailCatalog").isEnabled() ||
@@ -891,6 +883,14 @@ function resolveSystemSitePlan(systemID, options = {}) {
     if (matcher && !matcher(numericSystemID)) {
       continue;
     }
+    const placement = entry.fwPlacement;
+    const occupierID = placement?.occupierID ?? SPAWN_FACTIONS[entry.family];
+    if (occupierID) {
+      if (fwSystem === undefined) {
+        fwSystem = require("../faction/factionWarfareAuthority").getSystem(numericSystemID);
+      }
+      if (fwSystem?.occupierID !== occupierID) continue;
+    }
     if (
       entry.selectionAuthority === STRICT_SECURITY_ORE_SELECTION_AUTHORITY &&
       !oreAnomalySecurityAuthority.isEligibleSecurityTier(
@@ -902,7 +902,8 @@ function resolveSystemSitePlan(systemID, options = {}) {
     if (!systemHostsFamily(entry, numericSystemID)) {
       continue;
     }
-    const count = resolveFamilySiteCountForSystem(entry, numericSystemID);
+    const configuredCount = resolveFamilySiteCountForSystem(entry, numericSystemID);
+    const count = placement?.slotID ? Math.min(1, configuredCount) : configuredCount;
     if (count <= 0) {
       continue;
     }
@@ -913,6 +914,7 @@ function resolveSystemSitePlan(systemID, options = {}) {
       selectionAuthority: entry.selectionAuthority,
       lifetimeMs: entry.lifetimeMs,
       bandTuning: entry.tuningByBand.get(band) || {},
+      ...(placement ? { fwPlacement: placement } : {}),
     });
   }
   return plan;
@@ -1493,8 +1495,14 @@ function getUniverseSiteProviderID(siteKind) {
 }
 
 function buildUniverseSiteID(family, systemID, slotIndex) {
-  const base = UNIVERSE_SITE_ID_BASES[normalizeLowerText(family, "")];
+  const normalizedFamily = normalizeLowerText(family, "");
+  const base = UNIVERSE_SITE_ID_BASES[normalizedFamily];
   if (!base) {
+    const slotID = dungeonAuthority.getSpawnProfile(normalizedFamily)?.fwPlacement?.slotID;
+    const systemOffset = toInt(systemID, 0) - 30_000_000;
+    if (slotID && systemOffset >= 0 && systemOffset < 50_000 && slotIndex === 0) {
+      return 7_200_000_000_000 + slotID * 50_000_000 + systemOffset * UNIVERSE_SITE_ID_SYSTEM_STRIDE + 1;
+    }
     return 0;
   }
   return base + (toInt(systemID, 0) * UNIVERSE_SITE_ID_SYSTEM_STRIDE) + (Math.max(0, toInt(slotIndex, 0)) + 1);
@@ -1565,7 +1573,9 @@ function resolveUniverseSiteLabel(template, family, slotIndex) {
   if (
     resolvedName &&
     (
-      normalizedFamily.startsWith("drifter_")
+      normalizedFamily.startsWith("drifter_") ||
+      dungeonAuthority.getSpawnProfile(normalizedFamily)?.fwPlacement ||
+      Object.hasOwn(require("../faction/fwOpenModel").SPAWN_FACTIONS, normalizedFamily)
     )
   ) {
     return resolvedName;
@@ -1648,6 +1658,7 @@ function isMissionOnlyUniverseTemplate(template) {
 }
 
 function templateMatchesSpawnFamily(template, family, bandProfile) {
+  if (template?.metadataOnly === true) return false;
   // Phase 7 provides controlled placement. Organic incursion activation and
   // site scheduling must supply their own admitted context in Phase 8.
   if (template?.templateID === "evejs-incursion-vanguard:nation-commander-outpost") return false;
@@ -1657,6 +1668,11 @@ function templateMatchesSpawnFamily(template, family, bandProfile) {
   if ((Number(template?.sourceDungeonID) === 13890 || String(template?.templateID).startsWith("evejs-election:fabricator:")) && family !== "gallente_fabricator") return false;
   if ((Number(template?.sourceDungeonID) === 13978 || String(template?.templateID).startsWith("evejs-election:iteration-depot:")) && family !== "gallente_iteration_depot") return false;
   if (!template || typeof template !== "object") {
+    return false;
+  }
+  // Pirate insurgency activities are placed by a campaign, outside the
+  // ordinary universe site rotation. The catalog's combat family is shared.
+  if (isNativeInsurgencyTemplate(String(template.templateID ?? ""), Number(template.archetypeID))) {
     return false;
   }
   // The client dungeon catalog also contains ordinary agent-mission pockets.
@@ -1736,7 +1752,7 @@ function listFamilyTemplatesForBand(family, band, bandProfile) {
     bandTemplateCandidatesCache.set(cacheKey, cachedCandidates);
     return cachedCandidates;
   }
-  const fallbackCandidates = Object.freeze(allCandidates
+  const fallbackCandidates = Object.freeze([...allCandidates]
     .sort((left, right) => (
       toInt(left && left.sourceDungeonID, Number.MAX_SAFE_INTEGER) -
       toInt(right && right.sourceDungeonID, Number.MAX_SAFE_INTEGER)
@@ -2441,7 +2457,7 @@ function pickUniverseTemplateDescriptorForSlotWithPolicy(
     options.policyContext ||
     buildTemplatePolicyContext(family, systemID, band);
   const policyOptions = options.policyOptions || {};
-  const eligible = listPolicyEligibleTemplateDescriptorsForBand(
+  let eligible = listPolicyEligibleTemplateDescriptorsForBand(
     family,
     systemID,
     band,
@@ -2451,6 +2467,17 @@ function pickUniverseTemplateDescriptorForSlotWithPolicy(
   );
   if (eligible.length <= 0) {
     return null;
+  }
+  if (dungeonAuthority.getSpawnProfileReadOnly(family)?.fwPlacement?.size) {
+    const state = require("../faction/factionWarfareAuthority").getSystem(systemID)?.adjacencyState;
+    eligible = eligible.filter(({ descriptor }) => {
+      const required = dungeonAuthority.getTemplateByIDReadOnly(descriptor.templateID)?.fwCapturePolicy?.requiredOperationalStates;
+      return !required || required.includes(state);
+    });
+    if (!eligible.length) return null;
+    const preferred = eligible.filter(({ descriptor }) => dungeonAuthority
+      .getTemplateByIDReadOnly(descriptor.templateID)?.fwCapturePolicy?.operationalStates?.includes(state));
+    if (preferred.length) eligible = preferred;
   }
   const templateIndex = hashValue(
     (toInt(systemID, 0) * 4099) +
@@ -2581,16 +2608,6 @@ function pickUniverseTemplateForSlot(family, systemID, slotIndex, rotationIndex,
   return selection && selection.template || null;
 }
 
-function computeTemplateContentHash(template) {
-  return hashText(JSON.stringify({
-    contentPack: cloneValue(template && template._contentPack || null),
-    populationHints: cloneValue(template && template.populationHints || null),
-    environmentTemplates: cloneValue(template && template.environmentTemplates || null),
-    objectiveMetadata: cloneValue(template && template.objectiveMetadata || null),
-    siteSceneProfile: cloneValue(template && template.siteSceneProfile || null),
-  }));
-}
-
 // Every universe site definition hashed its template's content (five deep
 // copies plus a stringify), though the template is the same for every system
 // and slot. The hash is kept per template object in a WeakMap (after the
@@ -2659,7 +2676,7 @@ function getTemplateContentHash(template) {
 
 function buildUniverseSiteDefinition(template, family, systemID, slotIndex, options = {}) {
   const spawnFamilyKey = normalizeLowerText(options.spawnFamilyKey, family);
-  const siteID = buildUniverseSiteID(spawnFamilyKey, systemID, slotIndex);
+  const siteID = options.siteID || buildUniverseSiteID(spawnFamilyKey, systemID, slotIndex);
   if (siteID <= 0) {
     return null;
   }
@@ -3340,6 +3357,10 @@ function getInstanceRotationIndex(instance) {
   return Math.max(0, toInt(instance && instance.metadata && instance.metadata.rotationIndex, 0));
 }
 
+function getFwSlotSize(spawnFamilyKey) {
+  return dungeonAuthority.getSpawnProfileReadOnly(spawnFamilyKey)?.fwPlacement?.size;
+}
+
 function chooseRandomSystemIDs(systemIDs, count, rng = random) {
   const remaining = normalizeIntegerArray(systemIDs);
   const target = Math.max(0, Math.min(remaining.length, toInt(count, 0)));
@@ -3516,6 +3537,8 @@ function listDesiredUniverseDungeonSiteDefinitions(systemIDs, nowMs = Date.now()
   const allSystemIDs = normalizeSystemIDs(systemIDs);
   const familySummaries = {};
   const existingBySlot = new Map();
+  const blockedFwSlots = new Set();
+  const protectedFwSiteKeys = [];
   const requestedFamilies = new Set(
     (Array.isArray(options.families) ? options.families : [])
       .map((family) => normalizeLowerText(family, ""))
@@ -3540,6 +3563,7 @@ function listDesiredUniverseDungeonSiteDefinitions(systemIDs, nowMs = Date.now()
       definitions,
       families: familySummaries,
       oreSecurity,
+      protectedFwSiteKeys,
     };
   }
 
@@ -3555,6 +3579,12 @@ function listDesiredUniverseDungeonSiteDefinitions(systemIDs, nowMs = Date.now()
     if (!spawnFamilyKey || systemID <= 0) {
       continue;
     }
+    const fwSize = instance.templateID?.startsWith("evejs-fw:") && getFwSlotSize(spawnFamilyKey);
+    if (fwSize && require("../faction/fwOpenRewards").getReceipt(instance)) {
+      // The completed site still owns its grid until the players leave.
+      blockedFwSlots.add(`${systemID}:${fwSize}`);
+      protectedFwSiteKeys.push(instance.siteKey);
+    }
     const key = `${spawnFamilyKey}:${systemID}:${slotIndex}`;
     const existing = existingBySlot.get(key);
     if (
@@ -3566,12 +3596,26 @@ function listDesiredUniverseDungeonSiteDefinitions(systemIDs, nowMs = Date.now()
     }
   }
 
+  const { getNativeFactionID } = require("../faction/fwTerritoryCatalog");
+  const warzoneSystems = allSystemIDs.filter(systemID => getNativeFactionID(systemID) !== null);
+  const warzoneTerminalSites = warzoneSystems.length > 0
+    ? listUniversePersistentTerminalSummariesBySystems(warzoneSystems)
+    : [];
+  for (const instance of warzoneTerminalSites) {
+    if (instance.lifecycleReason !== require("../faction/fwOpenModel").DELAYED_REPLACEMENT_REASON) continue;
+    const size = getFwSlotSize(getInstanceSpawnFamilyKey(instance));
+    if (size) blockedFwSlots.add(`${instance.solarSystemID}:${size}`);
+  }
+
   for (const systemID of allSystemIDs) {
     // Shared across every family planned for this system; see
     // buildTemplatePolicyContext for why it is scoped to this call.
     const systemContextCache = new Map();
     for (const entry of resolveSystemSitePlan(systemID, { families: options.families })) {
-      const { family, band, count, lifetimeMs, bandTuning, selectionAuthority } = entry;
+      const { family, band, count, lifetimeMs, bandTuning, selectionAuthority, fwPlacement } = entry;
+      // Only the persistent lifecycle owner may refill a completed slot, even
+      // when the new occupier's spawn family differs from the captured one.
+      if (fwPlacement?.size && blockedFwSlots.has(`${systemID}:${fwPlacement.size}`)) continue;
       if (!familySummaries[family]) {
         familySummaries[family] = {
           desiredSiteCount: 0,
@@ -3696,6 +3740,7 @@ function listDesiredUniverseDungeonSiteDefinitions(systemIDs, nowMs = Date.now()
         }
         const definition = buildUniverseSiteDefinition(template, family, systemID, slotIndex, {
           rotationIndex,
+          siteID: fwPlacement?.size ? existing?.metadata?.siteID : undefined,
           startedAtMs: Math.max(0, toInt(nowMs, Date.now())),
           lifetimeMs,
           band,
@@ -3728,6 +3773,7 @@ function listDesiredUniverseDungeonSiteDefinitions(systemIDs, nowMs = Date.now()
     definitions,
     families: familySummaries,
     oreSecurity,
+    protectedFwSiteKeys,
   };
 }
 
@@ -3941,7 +3987,7 @@ function buildRotationDefinitionFromInstance(instance, nowMs = Date.now(), optio
     return buildGeneratedMiningRotationDefinitionFromInstance(instance, nowMs);
   }
   const family = normalizeLowerText(instance.siteFamily, "");
-  const spawnFamilyKey = normalizeLowerText(
+  const sourceFamily = normalizeLowerText(
     instance &&
     instance.metadata &&
     instance.metadata.spawnFamilyKey,
@@ -3953,19 +3999,24 @@ function buildRotationDefinitionFromInstance(instance, nowMs = Date.now(), optio
     ),
   );
   const systemID = Math.max(0, toInt(instance.solarSystemID, 0));
-  if (isSovereigntyGuaranteedSpawnFamily(spawnFamilyKey)) {
+  if (isSovereigntyGuaranteedSpawnFamily(sourceFamily)) {
     return buildSovereigntyRotationDefinitionFromInstance(instance, nowMs, options);
   }
-  if (!spawnFamilyKey || systemID <= 0) {
+  if (!sourceFamily || systemID <= 0) {
     return null;
   }
   // A site rotates in place. The system's own plan decides whether this family
   // still belongs here and which templates may fill the slot.
-  const planEntry = resolveSystemSitePlan(systemID, { families: [spawnFamilyKey] })
-    .find((entry) => entry.family === spawnFamilyKey) || null;
+  const fwSize = instance.templateID?.startsWith("evejs-fw:") && getFwSlotSize(sourceFamily);
+  const planEntry = fwSize
+    ? resolveSystemSitePlan(systemID).find(entry => entry.fwPlacement?.size === fwSize)
+    : resolveSystemSitePlan(systemID, { families: [sourceFamily] })[0];
   if (!planEntry) {
     return null;
   }
+  const spawnFamilyKey = planEntry.family;
+  if (fwSize && spawnFamilyKey !== sourceFamily && dungeonRuntime.listActiveInstancesBySystem(systemID)
+    .some(entry => getInstanceSpawnFamilyKey(entry) === spawnFamilyKey)) return null;
   const { band, bandTuning, lifetimeMs, count, selectionAuthority } = planEntry;
   const slotIndex = Math.max(
     0,
@@ -4064,6 +4115,7 @@ function buildRotationDefinitionFromInstance(instance, nowMs = Date.now(), optio
   return buildUniverseSiteDefinition(template, spawnFamilyKey, systemID, slotIndex, {
     spawnFamilyKey,
     rotationIndex: nextRotationIndex,
+    siteID: fwSize ? instance.metadata?.siteID : undefined,
     startedAtMs: Math.max(0, toInt(nowMs, Date.now())),
     lifetimeMs,
     band,
@@ -4103,6 +4155,12 @@ function terminalInstanceStillHoldsItsGrid(instance) {
   }
 }
 
+function hasDelayedUniverseReplacement(instance) {
+  return instance.lifecycleReason === require("../faction/fwOpenModel").DELAYED_REPLACEMENT_REASON ||
+    (normalizeLowerText(instance.siteOrigin, "") === "generatedmining" &&
+      normalizeLowerText(instance.lifecycleReason, "") === "depleted");
+}
+
 function shouldRotateUniversePersistentTerminalInstance(instance, nowMs) {
   // Flashpoints replace their regional slot at completion. Their old instance
   // remains the authority for the physical cache until its independent expiry.
@@ -4110,12 +4168,7 @@ function shouldRotateUniversePersistentTerminalInstance(instance, nowMs) {
   if (!instance) {
     return false;
   }
-  const isGeneratedMining =
-    normalizeLowerText(instance && instance.siteOrigin, "") === "generatedmining";
-  if (!isGeneratedMining) {
-    return true;
-  }
-  if (normalizeLowerText(instance && instance.lifecycleReason, "") !== "depleted") {
+  if (!hasDelayedUniverseReplacement(instance)) {
     return true;
   }
   const respawnAtMs = Math.max(0, toInt(instance && instance.timers && instance.timers.expiresAtMs, 0));
@@ -4182,10 +4235,7 @@ function getUniversePersistentLifecycleBoundariesBySystem(nowMs = Date.now(), op
     if (terminalInstanceStillHoldsItsGrid(instance)) {
       continue;
     }
-    const isDelayedGeneratedMiningRespawn =
-      normalizeLowerText(instance && instance.siteOrigin, "") === "generatedmining" &&
-      normalizeLowerText(instance && instance.lifecycleReason, "") === "depleted";
-    if (isDelayedGeneratedMiningRespawn) {
+    if (hasDelayedUniverseReplacement(instance)) {
       const timers = instance && instance.timers || {};
       consider(
         instance,
@@ -4340,6 +4390,7 @@ function advanceUniversePersistentSites(options = {}) {
   const emitExpiryEvents =
     options.emitExpiryEvents !== false &&
     lifecycleReason !== "startup-resume";
+  require("../faction/fwOpenRuntime").recoverVacatedSites(scopedSystemIDs, nowMs);
   const expired = dungeonRuntime.tickRuntime({
     nowMs,
     lifecycleReason,
@@ -5382,9 +5433,12 @@ function reconcileSystemUniverseFamilySlice(job, family) {
     systemIDs: [job.systemID],
     nowMs: job.nowMs,
     spawnFamilyFilter: [family],
-    preserveSiteKeys: listUniversePersistentTerminalSiteKeys([job.systemID], {
-      siteOrigins: ["universe_dungeon", SOV_GUARANTEED_SITE_ORIGIN],
-    }),
+    preserveSiteKeys: [
+      ...broadResult.protectedFwSiteKeys,
+      ...listUniversePersistentTerminalSiteKeys([job.systemID], {
+        siteOrigins: ["universe_dungeon", SOV_GUARANTEED_SITE_ORIGIN],
+      }),
+    ],
   });
   job.desiredSiteCount += broadResult.definitions.length;
   job.desiredPersistentSiteCount += broadResult.definitions.length;
@@ -5682,12 +5736,12 @@ function ensureSystemUniversePersistentSites(systemID, options = {}) {
       systemIDs: [numericSystemID],
       nowMs,
       siteOriginFilter: ["universe_dungeon", SOV_GUARANTEED_SITE_ORIGIN],
-      preserveSiteKeys: listUniversePersistentTerminalSiteKeys(
-        [numericSystemID],
-        {
+      preserveSiteKeys: [
+        ...broadResult.protectedFwSiteKeys,
+        ...listUniversePersistentTerminalSiteKeys([numericSystemID], {
           siteOrigins: ["universe_dungeon", SOV_GUARANTEED_SITE_ORIGIN],
-        },
-      ),
+        }),
+      ],
     })
     : {
       createdCount: 0,
@@ -5777,6 +5831,7 @@ module.exports = {
   listUniverseSeededGeneratedMiningInstances,
   listUniverseSeededPersistentSiteInstances,
   advanceUniversePersistentSites,
+  hasDelayedUniverseReplacement,
   getUniversePersistentLifecycleBoundary,
   getUniversePersistentLifecycleBoundariesBySystem,
   resetStartupMiningAnomalies,

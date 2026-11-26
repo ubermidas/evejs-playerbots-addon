@@ -28,8 +28,8 @@ function copyPackage(into) {
 function fakeEveJS(root) {
   fs.mkdirSync(path.join(root, "server"), { recursive: true });
   fs.mkdirSync(path.join(root, "docker"), { recursive: true });
-  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ version: "261115.2" }));
-  fs.writeFileSync(path.join(root, "server/package.json"), JSON.stringify({ version: "261115.2" }));
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ version: "261125.3" }));
+  fs.writeFileSync(path.join(root, "server/package.json"), JSON.stringify({ version: "261125.3" }));
   fs.writeFileSync(path.join(root, "docker/entrypoint.sh"), "#!/bin/sh\n");
   fs.writeFileSync(path.join(root, "compose.yaml"), "services: {}\n");
   return root;

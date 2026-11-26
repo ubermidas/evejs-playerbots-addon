@@ -775,6 +775,7 @@ function resolveBountyPayout(targetEntity, finalAttacker = {}, options = {}) {
   const result = bountyRuntime.recordNpcBountyKill(targetEntity, finalAttacker, {
     nowMs: options.whenMs,
     solarSystemID: toPositiveInt(targetEntity && targetEntity.systemID, null),
+    deferSave: options.deferSave,
   });
   if (result && result.eligible === true) {
     return result.amount;
@@ -1002,6 +1003,7 @@ function recordCombatAchievement(killRecord, context = {}) {
       victimEntity: context.targetEntity,
       victimIdentity: context.victimIdentity,
       finalAttacker: context.finalAttacker,
+      deferSave: context.deferSave,
     });
   } catch (error) {
     // Killmail persistence and combat state must never be held hostage by
@@ -1068,6 +1070,7 @@ function recordKillmailFromDestruction(targetEntity, destroyResult, options = {}
     victimIdentity,
     iskLost,
     payoutID: `kill:${ledgerKey}`,
+    deferSave: !options.idempotencyKey,
   });
   // Faction standing loss (TQ parity): destroying a faction NPC lowers standing with its faction
   // only (single-faction hit, no derived; debounced per character/faction/system, calibrated from
@@ -1183,6 +1186,7 @@ function recordKillmailFromDestruction(targetEntity, destroyResult, options = {}
         targetEntity,
         victimIdentity,
         finalAttacker,
+        deferSave: true,
       });
     }
     ledgersByVictim.delete(ledgerKey);
@@ -1208,6 +1212,7 @@ function recordKillmailFromDestruction(targetEntity, destroyResult, options = {}
       targetEntity,
       victimIdentity,
       finalAttacker,
+      deferSave: !options.idempotencyKey,
     });
   }
   if (record && toPositiveInt(record.killID, 0) > 0 && killRightActivation) {

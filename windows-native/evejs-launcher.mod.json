@@ -2,7 +2,7 @@
   "schemaVersion": 3,
   "id": "evejs-playerbots-native",
   "displayName": "Playerbots (Windows, Luna Update)",
-  "version": "0.2.152.16",
+  "version": "0.2.152.17",
   "description": "Windows Native Luna Playerbots with level 1 Security, Mining, and Distribution agent work, corporation income, and stock or multicore support.",
   "kind": "source-integrated",
   "supportedBackends": [

@@ -1,10 +1,10 @@
 "use strict";
 
 const { cloneValue: walkCloneValue } = require("../../common/clone");
-const fs = require("fs");
 const path = require("path");
 
 const database = require(path.join(__dirname, "../../gameStore"));
+const { TABLE, readStaticTable } = require("../_shared/referenceData");
 const {
   currentFileTime,
 } = require(path.join(__dirname, "../_shared/serviceHelpers"));
@@ -35,7 +35,7 @@ const ALLIANCES_TABLE = "alliances";
 const CHARACTERS_TABLE = "characters";
 const STATIONS_TABLE = "stations";
 const OWNED_TABLES = new Set([CORPORATIONS_TABLE, ALLIANCES_TABLE]);
-const NPC_CORPORATION_SEED_VERSION = 2;
+const NPC_CORPORATION_SEED_VERSION = 3;
 const OWNER_TYPE_CORPORATION = 2;
 const OWNER_TYPE_ALLIANCE = 16159;
 const OWNER_TYPE_CHARACTER = 1373;
@@ -52,17 +52,6 @@ const DEFAULT_CUSTOM_CORPORATION_LOGO = Object.freeze({
   color3: null,
   typeface: null,
 });
-const REPO_ROOT = path.resolve(__dirname, "../../../..");
-const DEFAULT_STATIC_JSONL_ROOTS = Object.freeze([
-  path.join(REPO_ROOT, "data"),
-  path.join(REPO_ROOT, "_local", "sde"),
-]);
-
-let npcCorporationCache = null;
-let npcCharacterCache = null;
-let cachedStaticJsonlDirectoryPath = null;
-let cachedNpcCorporationSourcePath = null;
-let cachedNpcCharacterSourcePath = null;
 let corporationsBootstrapComplete = false;
 let alliancesBootstrapComplete = false;
 let corporationMembersIndexCache = null;
@@ -131,26 +120,6 @@ function normalizeInteger(value, fallback = 0) {
 function normalizePositiveInteger(value, fallback = null) {
   const numeric = normalizeInteger(value, 0);
   return numeric > 0 ? numeric : fallback;
-}
-
-function normalizeLocalizedText(value, fallback = "") {
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (value && typeof value === "object") {
-    if (typeof value.en === "string" && value.en.trim()) {
-      return value.en;
-    }
-
-    for (const localizedValue of Object.values(value)) {
-      if (typeof localizedValue === "string" && localizedValue.trim()) {
-        return localizedValue;
-      }
-    }
-  }
-
-  return fallback;
 }
 
 function normalizeNameKey(value) {
@@ -284,153 +253,6 @@ function normalizeAllianceTable(payload = {}) {
         ? cloneValue(payload.records)
         : {},
   };
-}
-
-function parseJsonlFile(filePath) {
-  if (!fs.existsSync(filePath)) {
-    return [];
-  }
-
-  return fs
-    .readFileSync(filePath, "utf8")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch (error) {
-        // ignored: an unreadable line is dropped by the filter below
-        return null;
-      }
-    })
-    .filter(Boolean);
-}
-
-function getStaticJsonlRoots() {
-  const roots = [];
-  if (process.env.EVEJS_STATIC_JSONL_ROOT) {
-    roots.push(path.resolve(process.env.EVEJS_STATIC_JSONL_ROOT));
-  }
-  roots.push(...DEFAULT_STATIC_JSONL_ROOTS);
-  return roots;
-}
-
-function listStaticJsonlDirectoryCandidates(rootPath) {
-  if (!rootPath || !fs.existsSync(rootPath)) {
-    return [];
-  }
-
-  const candidates = [];
-  const rootName = path.basename(rootPath);
-  if (
-    /^eve-online-static-data-\d+-jsonl$/i.test(rootName) &&
-    fs.existsSync(path.join(rootPath, "npcCorporations.jsonl"))
-  ) {
-    candidates.push({
-      name: rootName,
-      fullPath: rootPath,
-    });
-  }
-
-  try {
-    const directoryEntries = fs.readdirSync(rootPath, { withFileTypes: true });
-    for (const entry of directoryEntries) {
-      if (
-        !entry ||
-        !entry.isDirectory() ||
-        !/^eve-online-static-data-\d+-jsonl$/i.test(entry.name)
-      ) {
-        continue;
-      }
-      const fullPath = path.join(rootPath, entry.name);
-      if (!fs.existsSync(path.join(fullPath, "npcCorporations.jsonl"))) {
-        continue;
-      }
-      candidates.push({
-        name: entry.name,
-        fullPath,
-      });
-    }
-  } catch (_error) {
-    return candidates;
-  }
-
-  return candidates;
-}
-
-function resolveLatestStaticJsonlDirectoryPath() {
-  if (cachedStaticJsonlDirectoryPath !== null) {
-    return cachedStaticJsonlDirectoryPath;
-  }
-
-  const candidateDirectory = getStaticJsonlRoots()
-    .flatMap((rootPath) => listStaticJsonlDirectoryCandidates(rootPath))
-    .sort((left, right) => right.name.localeCompare(left.name))[0];
-
-  cachedStaticJsonlDirectoryPath = candidateDirectory
-    ? candidateDirectory.fullPath
-    : "";
-
-  return cachedStaticJsonlDirectoryPath;
-}
-
-function resolveNpcCorporationSourcePath() {
-  if (cachedNpcCorporationSourcePath !== null) {
-    return cachedNpcCorporationSourcePath;
-  }
-
-  const directoryPath = resolveLatestStaticJsonlDirectoryPath();
-  const candidatePath = directoryPath
-    ? path.join(directoryPath, "npcCorporations.jsonl")
-    : "";
-  cachedNpcCorporationSourcePath = fs.existsSync(candidatePath)
-    ? candidatePath
-    : "";
-  return cachedNpcCorporationSourcePath;
-}
-
-function resolveNpcCharacterSourcePath() {
-  if (cachedNpcCharacterSourcePath !== null) {
-    return cachedNpcCharacterSourcePath;
-  }
-
-  const directoryPath = resolveLatestStaticJsonlDirectoryPath();
-  const candidatePath = directoryPath
-    ? path.join(directoryPath, "npcCharacters.jsonl")
-    : "";
-  cachedNpcCharacterSourcePath = fs.existsSync(candidatePath)
-    ? candidatePath
-    : "";
-  return cachedNpcCharacterSourcePath;
-}
-
-function loadNpcCorporations() {
-  if (npcCorporationCache) {
-    return npcCorporationCache;
-  }
-
-  npcCorporationCache = new Map(
-    parseJsonlFile(resolveNpcCorporationSourcePath()).map((entry) => [
-      normalizePositiveInteger(entry._key, 0),
-      entry,
-    ]),
-  );
-  return npcCorporationCache;
-}
-
-function loadNpcCharacters() {
-  if (npcCharacterCache) {
-    return npcCharacterCache;
-  }
-
-  npcCharacterCache = new Map(
-    parseJsonlFile(resolveNpcCharacterSourcePath()).map((entry) => [
-      normalizePositiveInteger(entry._key, 0),
-      entry,
-    ]),
-  );
-  return npcCharacterCache;
 }
 
 function readCharacters() {
@@ -675,48 +497,6 @@ function isNpcCorporationID(corporationID) {
   return numericID >= 1000000 && numericID < 2000000;
 }
 
-function buildNpcCorporationRecord(rawRecord) {
-  const corporationID = normalizePositiveInteger(rawRecord._key, 0) || 0;
-  const corporationName = normalizeLocalizedText(
-    rawRecord.name,
-    `Corporation ${corporationID}`,
-  );
-  const tickerName =
-    String(rawRecord.tickerName || "").trim() ||
-    buildTickerFromName(corporationName, "NPC");
-
-  return {
-    corporationID,
-    corporationName,
-    tickerName,
-    description: normalizeLocalizedText(rawRecord.description, ""),
-    ceoID: normalizePositiveInteger(rawRecord.ceoID, null),
-    creatorID: normalizePositiveInteger(rawRecord.ceoID, null),
-    allianceID: null,
-    stationID: normalizePositiveInteger(rawRecord.stationID, null),
-    solarSystemID: normalizePositiveInteger(rawRecord.solarSystemID, null),
-    factionID: normalizePositiveInteger(rawRecord.factionID, null),
-    raceID: normalizePositiveInteger(rawRecord.raceID, null),
-    deleted: rawRecord.deleted ? 1 : 0,
-    shares: normalizeInteger(rawRecord.shares, 0),
-    taxRate: Number(rawRecord.taxRate || 0),
-    loyaltyPointTaxRate: 0.0,
-    friendlyFire: 0,
-    memberLimit: normalizeInteger(rawRecord.memberLimit, -1),
-    url: "",
-    hasPlayerPersonnelManager: Boolean(rawRecord.hasPlayerPersonnelManager),
-    isNPC: true,
-    createdAt: filetimeNowString(),
-    shape1: null,
-    shape2: null,
-    shape3: null,
-    color1: null,
-    color2: null,
-    color3: null,
-    typeface: null,
-  };
-}
-
 function ensureCorporationsInitialized() {
   if (corporationsBootstrapComplete) {
     const table = readTableView(CORPORATIONS_TABLE, {
@@ -749,14 +529,14 @@ function ensureCorporationsInitialized() {
     table._meta.npcSeedVersion !== NPC_CORPORATION_SEED_VERSION;
   let mutated = shouldRefreshNpcCorporations;
 
-  for (const [corporationID, rawRecord] of loadNpcCorporations().entries()) {
-    const recordKey = String(corporationID);
+  const npcCorporations = readStaticTable(TABLE.NPC_OWNER_DIRECTORY).corporationsByID || {};
+  for (const [recordKey, seed] of Object.entries(npcCorporations)) {
     if (
       shouldRefreshNpcCorporations ||
       !table.records[recordKey] ||
       table.records[recordKey].isNPC !== true
     ) {
-      table.records[recordKey] = buildNpcCorporationRecord(rawRecord);
+      table.records[recordKey] = { ...seed, createdAt: filetimeNowString() };
       mutated = true;
     }
   }
@@ -959,52 +739,22 @@ function getAllianceOwnerRecord(allianceID) {
 }
 
 function getNpcCharacterOwnerRecord(characterID) {
-  const numericCharacterID = normalizePositiveInteger(characterID, 0) || 0;
-  if (!numericCharacterID) {
-    return null;
-  }
-
-  const rawRecord = loadNpcCharacters().get(numericCharacterID);
-  if (!rawRecord) {
-    return null;
-  }
-
+  const record = getNpcCharacterRecord(characterID);
+  if (!record) return null;
   return {
-    ownerID: numericCharacterID,
-    ownerName: normalizeLocalizedText(
-      rawRecord.name,
-      `Entity ${numericCharacterID}`,
-    ),
+    ownerID: record.characterID,
+    ownerName: record.characterName,
     typeID: OWNER_TYPE_CHARACTER,
-    gender: rawRecord.gender ? 1 : 0,
+    gender: record.gender,
     tickerName: null,
   };
 }
 
-// An NPC character's row of the static data (npcCharacters): its name, bloodline, race, corporation, gender and
-// its start there ("YYYY-MM-DD hh:mm:ss", UTC), or null for an id the table has not.
 function getNpcCharacterRecord(characterID) {
-  const numericCharacterID = normalizePositiveInteger(characterID, 0) || 0;
-  const rawRecord = numericCharacterID
-    ? loadNpcCharacters().get(numericCharacterID)
-    : null;
-  if (!rawRecord) {
-    return null;
-  }
-
-  return {
-    characterID: numericCharacterID,
-    characterName: normalizeLocalizedText(
-      rawRecord.name,
-      `Entity ${numericCharacterID}`,
-    ),
-    bloodlineID: normalizePositiveInteger(rawRecord.bloodlineID, null),
-    raceID: normalizePositiveInteger(rawRecord.raceID, null),
-    corporationID: normalizePositiveInteger(rawRecord.corporationID, null),
-    gender: rawRecord.gender ? 1 : 0,
-    startDate:
-      typeof rawRecord.startDate === "string" ? rawRecord.startDate : null,
-  };
+  const id = normalizePositiveInteger(characterID, 0);
+  if (!id) return null;
+  const record = readStaticTable(TABLE.NPC_OWNER_DIRECTORY).charactersByID?.[id];
+  return record ? { ...record } : null;
 }
 
 function getOwnerLookupRecord(ownerID) {
@@ -1429,7 +1179,7 @@ function setCorporationRecord(record) {
   return writeTable(CORPORATIONS_TABLE, table);
 }
 
-function setCharacterAffiliation(characterID, corporationID, allianceID = null) {
+function setCharacterAffiliation(characterID, corporationID, allianceID = null, { durable = false } = {}) {
   const numericCharacterID = normalizePositiveInteger(characterID, 0) || 0;
   const numericCorporationID = normalizePositiveInteger(corporationID, 0) || 0;
   const normalizedAllianceID = normalizePositiveInteger(allianceID, null);
@@ -1454,7 +1204,9 @@ function setCharacterAffiliation(characterID, corporationID, allianceID = null) 
 
   let stagedCareer = false;
   let previousCorporationID;
+  let beforeMilitiaMove = null;
   const updateResult = updateCharacterStateRecord(numericCharacterID, (record) => {
+    if (durable) beforeMilitiaMove = record;
     // Replayed membership transitions must flush evidence left in the cache by
     // an interrupted/refused durable checkpoint before acknowledging success.
     stagedCareer = Number(record.careerActivityEvidence?.metrics?.["social:corporation"]?.value) > 0;
@@ -1502,6 +1254,21 @@ function setCharacterAffiliation(characterID, corporationID, allianceID = null) 
     }
 
     updatedRecord.employmentHistory = employmentHistory;
+    if (corporationChanged) {
+      const { getFactionIDForMilitiaCorporationID } = require("../faction/factionWarfareAuthority");
+      const militia = getFactionIDForMilitiaCorporationID(numericCorporationID);
+      if (militia || getFactionIDForMilitiaCorporationID(currentCorporationID)) {
+        beforeMilitiaMove = record;
+        const faction = normalizePositiveInteger(record.directFactionID, null) || militia;
+        updatedRecord.warFactionID = faction;
+        if (Object.hasOwn(record, "warfactionid")) updatedRecord.warfactionid = faction;
+        if (Object.hasOwn(record, "militiaFactionID")) updatedRecord.militiaFactionID = faction;
+        if (militia) {
+          const { getWallclockNowMs } = require("../../space/runtime/runtimeClock");
+          updatedRecord.careerFwEnlistment = { factionID: militia, enlistedAtMs: Math.max(1, Math.trunc(getWallclockNowMs())) };
+        }
+      }
+    }
     if (corporationChanged && currentCorporationID > 0 &&
         getCorporationRecord(numericCorporationID)?.isNPC === false) {
       const staged = require("../career/careerEventLedger").stageCharacter(updatedRecord, numericCharacterID,
@@ -1515,10 +1282,24 @@ function setCharacterAffiliation(characterID, corporationID, allianceID = null) 
   if (updateResult && updateResult.success) {
     if (previousCorporationID === undefined) markCorporationMembersIndexDirty();
     else updateCorporationMembersIndex(numericCharacterID, previousCorporationID, numericCorporationID);
-    if (stagedCareer) {
-      const flushed = database.flushTableSync(CHARACTERS_TABLE);
-      if (!flushed?.success) return flushed || { success: false, errorMsg: "CAREER_CORPORATION_FLUSH_FAILED" };
-      require("../career/careerEventLedger").publishCommitted(numericCharacterID);
+    if (stagedCareer || beforeMilitiaMove) {
+      let flushed;
+      try {
+        flushed = database.flushTableSync(CHARACTERS_TABLE);
+      } catch (error) {
+        if (!beforeMilitiaMove) throw error;
+        flushed = { success: false, errorMsg: error.message };
+      }
+      if (!flushed?.success) {
+        if (beforeMilitiaMove) {
+          updateCharacterStateRecord(numericCharacterID, () => beforeMilitiaMove);
+          // The membership was rolled back; rebuild the members index from records.
+          markCorporationMembersIndexDirty();
+        }
+        return flushed || { success: false, errorMsg: beforeMilitiaMove
+          ? "CORPORATION_AFFILIATION_FLUSH_FAILED" : "CAREER_CORPORATION_FLUSH_FAILED" };
+      }
+      if (stagedCareer) require("../career/careerEventLedger").publishCommitted(numericCharacterID);
     }
     if (bookmarkAccessBefore && bookmarkAccessBefore.size > 0) {
       try {

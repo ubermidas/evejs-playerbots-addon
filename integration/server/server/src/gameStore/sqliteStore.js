@@ -26,11 +26,15 @@ const path = require("path");
 const crypto = require("crypto");
 const storeRoot = require("./storeRoot");
 const persistenceLeasePolicy = require("./persistenceLeasePolicy");
+const { APPLICATION_ID, SCHEMA_VERSION, TYPED_TABLES } = require("./shared-schema/version");
+const { hasSubtreeDigests, subtreeDigests } = require("./shared-schema/subtreeDigests");
+const { tryWriteCorporationCharge } = require("./shared-schema/walletChargeSql");
 
 let Database = null;
 let db = null;
 let dbPath = null;
 let dbReadOnly = false;
+let sharedSchema = false;
 
 // SQL identifiers are interpolated into DDL/DML, so hard-fail on anything
 // that is not a plain table name. Every real table name is camelCase ascii.
@@ -69,12 +73,19 @@ function assertSafeTableName(table) {
 // are stored one row per entity (key "group\u001fentityID"), so one change is
 // one small row. Everything not listed is unchanged (flat).
 const ROW_GROUPS = {
-  items: ["__evejsInventoryGrantReceipts", "__evejsCareerCombatOutcomes", "__evejsIncursionCombatOutcomes"],
+  items: [
+    "__evejsInventoryGrantReceipts", "__evejsCareerCombatOutcomes", "__evejsIncursionCombatOutcomes",
+    "__evejsIncursionLogisticsHealth", "__evejsIncursionFactoryWithdrawals",
+  ],
   achievements: ["characters"],
+  dailyGoals: ["byCharacter", "monthly", "rewardSettlements"],
+  fwOpenReplay: ["organizationEnlistments", "membershipWarnings"],
+  freelanceProjects: ["projects", "deliveries"],
   notifications: ["boxes"],
   miningRuntimeState: ["systems"],
   wormholeRuntimeState: ["pairsByID", "staticSlotsByKey", "polarizationByCharacter"],
-  alliances: ["records"],
+  alliances: ["records", "affiliationChangesByCorporation"],
+  corporations: ["records"],
   bookmarkFolders: ["records"],
   bookmarkGroups: ["records"],
   bookmarkKnownFolders: ["recordsByCharacterID"],
@@ -82,9 +93,14 @@ const ROW_GROUPS = {
   calendarEvents: ["events"],
   calendarResponses: ["responses"],
   characterEnergyState: ["characters"],
+  characterNotes: ["characters"],
+  contractSettlements: ["byContractID"],
   corporationBills: ["bills", "automaticPaySettingsByOwner"],
-  corporationGoals: ["goalsByID"],
-  customsInspectionCases: ["byCaseID"],
+  corporationGoals: ["goalsByID", "records"],
+  corporationFoundings: ["byCharacter"],
+  allianceFoundings: ["byCorporation"],
+  allianceDepartures: ["departuresByOperationID", "activeDepartureByCorporationID", "closuresByAllianceID", "pendingSovTransfersByAllianceID"],
+  corporationLiquidations: ["pending"],
   corporationRuntime: [
     "corporations", "alliances", "wars", "warNegotiations",
     "mutualWarInvites", "mutualWarInviteBlocks", "peaceTreaties",
@@ -92,32 +108,49 @@ const ROW_GROUPS = {
   dungeonRuntimeState: ["instancesByID"],
   homefrontReplay: ["operations", "receipts", "pending"],
   observatoryFlashpointReplay: ["receipts", "pending", "loot", "trades"],
-  incursionReplay: ["operations", "receipts", "pending", "releases", "history"],
+  incursionReplay: ["operations", "receipts", "pending", "releases", "history", "closures", "terminalOutcomes"],
   incursionLifecycle: ["tales", "requests"],
   industryBlueprintState: ["records"],
+  industryFacilityState: ["facilities"],
   industryJobs: ["jobs"],
+  industryInstallSettlements: ["byCharacter"],
   industryRuntime: ["monitors"],
-  insuranceContracts: ["contractsByShipID", "contractHistoryByID", "payoutLedgerByLossID"],
-  lpWallets: ["characterWallets", "corporationWallets"],
-  miningLedger: ["characters", "observers"],
-  killRights: ["rights", "activations"],
+  jumpBridgeSettlements: ["byCharacter"],
+  reprocessingFacilityState: ["facilities"],
+  reprocessingSettlements: ["byCharacter"],
+  insuranceContracts: ["contractsByShipID", "contractHistoryByID", "payoutLedgerByLossID", "pendingOperationsByID"],
+  lpWallets: ["characterWallets", "corporationWallets", "operationReceipts"],
+  evermarkPurchases: ["byCharacter"],
+  lpStorePurchases: ["byCharacter"],
+  miningLedger: ["characters", "observers", "careerOreQuantities", "events", "observerHeaders"],
+  killRights: ["rights", "activations", "purchases"],
+  contrabandPenalties: ["byOperationID"],
+  customsInspectionCases: ["byCaseID"],
   killmails: ["records", "pending"],
   mail: ["messages", "mailboxes", "mailingLists"],
   mapTelemetry: ["visitsByCharacterID"],
   missionRuntimeState: ["charactersByID"],
+  missionRewardSettlements: ["byOperationID"],
   researchRuntimeState: ["charactersByID"],
   moduleGroupingState: ["ships"],
   moonExtractions: ["resourcesByStructureID", "extractions"],
-  npcEntities: ["entities", "incursionOutcomes"],
+  newEdenStoreRuntime: ["accounts"],
+  newEdenStorePurchaseSettlements: ["byOperationID"],
+  npcEntities: ["entities", "incursionOutcomes", "nativeAbilityState", "incursionSupportHealth"],
+  npcControlState: ["startupRuleOverrides", "characterFlags", "systemGateControls"],
   npcModules: ["modules"],
+  npcCargo: ["cargo", "miningTransfers"],
   npcRuntimeControllers: ["controllers"],
+  npcWrecks: ["wrecks"],
+  npcWreckItems: ["items"],
   overviewSharedPresets: ["entries"],
-  planetOrbitalState: ["orbitalsByID"],
+  planetOrbitalState: ["orbitalsByID", "replacementsByPlanet"],
+  planetaryCustomsSettlements: ["byCharacter"],
   planetRuntimeState: [
     "resourcesByPlanetID", "coloniesByKey", "launchesByID", "acceptedNetworkEditsByKey",
-    "networkEditReceiptsByKey",
+    "networkEditReceiptsByKey", "customsOperationReceipts",
   ],
-  playerBounties: ["pools", "contributions", "hunterStats"],
+  playerBounties: ["pools", "contributions", "hunterStats", "payoutsByID"],
   playerBots: ["_taskRecords"],
   rafflesRuntime: ["reservations"],
   repairOperations: ["operationsByID"],
@@ -137,8 +170,12 @@ const ROW_GROUPS = {
   evermarkEntitlements: ["characters"],
   pendingNpcBounties: ["npcTypes", "__events"],
   dynamicResourceRuntime: ["systems", "funding", "settlements", "unlocks", "losses"],
-  probeRuntimeState: ["probesByID"],
+  probeRuntimeState: ["charactersByID", "probesByID"],
   shipLogoFittings: ["ships"],
+  shipSkinComponentRuntime: ["finite", "infinite", "activations", "reservations", "storeGrants"],
+  shipSkinDraftRuntime: ["drafts", "designs", "requests"],
+  shipSkinSequencingRuntime: ["jobs", "requests"],
+  shipSkinThirdPartyRuntime: ["licenses", "grants", "mutations", "listings", "requests", "operations", "componentStock", "importedDesigns"],
   chatState: ["channels", "privateChannelByPair"],
   chatStaticContracts: ["observations"],
   chatBacklog: ["entriesByRoomName"],
@@ -183,7 +220,7 @@ function careerExceptionalOwnerPredicate(definition) {
 }
 function createCareerReadIndex(table) {
   const definition = CAREER_READS[table];
-  if (!definition) return;
+  if (!definition || (sharedSchema && TYPED_TABLES.has(table))) return;
   requireWritableDb().exec(`CREATE INDEX IF NOT EXISTS career_${table}_owner_v1
     ON "${table}"(${careerOwnerExpression(definition)}) WHERE ${careerReadPredicate(definition)}`);
   requireWritableDb().exec(`CREATE INDEX IF NOT EXISTS career_${table}_exceptional_owner_v1
@@ -447,10 +484,18 @@ function persistenceOutboxCreateSql(tableName = "_persistence_outbox") {
 
 function ensurePersistenceSchema() {
   const connection = requireWritableDb();
+  // A persistence worker attaches while its peer may already be writing. A
+  // current schema needs only WAL reads; requesting BEGIN IMMEDIATE here can
+  // make that worker fail to open behind a long main-thread transaction.
+  const columnsOf = (table) => new Set(connection.prepare(`PRAGMA table_info('${table}')`).all().map(column => column.name));
+  const owners = columnsOf("_persistence_owners"), outbox = columnsOf("_persistence_outbox");
+  if (["owner_role", "epoch", "instance_id", "active", "exclusive", "lease_expires_at", "acquired_at", "released_at"]
+    .every(column => owners.has(column)) &&
+    ["operation_id", "table_name", "owner_role", "owner_epoch", "owner_instance_id", "upserts_json", "deletes_json", "state", "created_at", "applied_at"]
+      .every(column => outbox.has(column))) return;
   // Cluster peers can open the same database concurrently during startup.
-  // Serialize inspection as well as DDL: checking the legacy columns before
-  // acquiring the write lock would let a waiter rebuild the table a second
-  // time after another process had already committed the migration.
+  // When migration is needed, inspect again under the write lock so a waiter
+  // cannot repeat a migration another peer has already committed.
   const ensure = connection.transaction(() => {
     connection.exec(`
       CREATE TABLE IF NOT EXISTS _persistence_owners (
@@ -722,12 +767,13 @@ function acquirePersistenceOwner(ownerRole, instanceId, options = {}) {
 }
 
 function renewPersistenceOwner(ownerFence, options = {}) {
-  requireWritableDb();
+  const connection = requireWritableDb();
   const leaseMs = normalizePersistenceOwnerLeaseMs(options.leaseMs);
-  const renew = requireDb().transaction(() => {
+  const checkpointOnCommit = options.checkpointOnCommit === true;
+  const renew = connection.transaction(() => {
     const fence = assertActivePersistenceOwner(ownerFence);
     const leaseExpiresAt = Date.now() + leaseMs;
-    const result = requireDb()
+    const result = connection
       .prepare(
         `UPDATE _persistence_owners
          SET lease_expires_at = ?
@@ -748,9 +794,18 @@ function renewPersistenceOwner(ownerFence, options = {}) {
         { ownerRole: fence.ownerRole, ownerEpoch: fence.epoch },
       );
     }
+    if (checkpointOnCommit) {
+      connection.pragma("wal_autocheckpoint = 1000");
+    }
     return { ...fence, leaseExpiresAt };
   });
-  return copyPersistenceOwnerFence(renew.immediate());
+  try {
+    return copyPersistenceOwnerFence(renew.immediate());
+  } finally {
+    if (checkpointOnCommit) {
+      disableWalAutoCheckpoint();
+    }
+  }
 }
 
 function releasePersistenceOwner(ownerFence) {
@@ -868,7 +923,7 @@ function adoptLegacyPersistenceOperations(ownerFence, tableNames) {
  * query_only modes and never execute schema or journal DDL.
  */
 function init(targetPath, options = {}) {
-  const normalizedPath = path.resolve(targetPath);
+  const normalizedPath = storeRoot.assertOutsideSourceStore(targetPath);
   const readOnly = options.readOnly === true;
   if (db && dbPath === normalizedPath && dbReadOnly === readOnly) {
     return db;
@@ -889,6 +944,10 @@ function init(targetPath, options = {}) {
     );
     dbPath = normalizedPath;
     dbReadOnly = readOnly;
+    sharedSchema = db.pragma("application_id", { simple: true }) === APPLICATION_ID;
+    if (sharedSchema && db.pragma("user_version", { simple: true }) !== SCHEMA_VERSION) {
+      throw new Error("Unsupported shared game database schema version");
+    }
     db.pragma("busy_timeout = 5000");
     if (readOnly) {
       db.pragma("query_only = ON");
@@ -908,11 +967,18 @@ function init(targetPath, options = {}) {
     // Durable handoff journal for asynchronous persistence writes. Operation
     // identities stay global and table_name remains globally UNIQUE.
     ensurePersistenceSchema();
+    if (sharedSchema) {
+      require("./shared-schema/upgrades").applySharedSchemaUpgrades(db, Database);
+    }
     return db;
   } catch (error) {
     close();
     throw error;
   }
+}
+
+function disableWalAutoCheckpoint() {
+  requireWritableDb().pragma("wal_autocheckpoint = 0");
 }
 
 function isMigrated(table) {
@@ -944,7 +1010,12 @@ function assertDirectMutationOwner(requestedFence) {
 
 function createSqlTable(table) {
   assertSafeTableName(table);
-  requireWritableDb().exec(
+  const connection = requireWritableDb();
+  if (sharedSchema && TYPED_TABLES.has(table)) {
+    existingTableConnection(table);
+    return;
+  }
+  connection.exec(
     `CREATE TABLE IF NOT EXISTS "${table}" (key TEXT PRIMARY KEY, json TEXT NOT NULL)`,
   );
   createCareerReadIndex(table);
@@ -958,6 +1029,7 @@ function createSqlTable(table) {
 }
 
 function createDungeonReadIndexes() {
+  if (sharedSchema && TYPED_TABLES.has("dungeonRuntimeState")) return;
   requireWritableDb().exec(
     `CREATE INDEX IF NOT EXISTS dungeon_runtime_abyssal_instances_v1
      ON "dungeonRuntimeState"(key) WHERE ${ABYSSAL_INSTANCE_PREDICATE}`,
@@ -1019,13 +1091,22 @@ function ensureSqlTable(table) {
   ensuredTables.add(table);
 }
 
+// A typed table is a view whose write trigger reads the row document in every one of
+// its statements. Handed over as JSONB, the document is parsed once instead of once per
+// statement, and what the view stores and reads back is unchanged. A change-aware
+// table (dungeon instances) also gets digests of the row's parts, so its triggers
+// skip the parts that did not change.
 function getUpsertStatement(table) {
   if (!upsertStatements.has(table)) {
     upsertStatements.set(
       table,
       requireDb().prepare(
-        `INSERT INTO "${table}"(key, json) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET json = excluded.json`,
+        sharedSchema && TYPED_TABLES.has(table)
+          ? hasSubtreeDigests(table)
+            ? `INSERT INTO "${table}"(key, json, subtree_digests) VALUES (?, jsonb(?), jsonb(?))`
+            : `INSERT INTO "${table}"(key, json) VALUES (?, jsonb(?))`
+          : `INSERT INTO "${table}"(key, json) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET json = excluded.json`,
       ),
     );
   }
@@ -1325,63 +1406,210 @@ function enqueuePersistenceOperation(
   deletes = [],
   ownerFence,
 ) {
-  requireWritableDb();
-  const normalizedTable = normalizePersistenceTable(table);
-  const normalizedUpserts = validatePersistenceUpserts(upserts);
-  const normalizedDeletes = validatePersistenceDeletes(deletes);
+  return enqueuePersistenceOperations([{ table, upserts, deletes }], ownerFence)[0];
+}
+
+function runWalletTimedTransaction(db, phase, enabled, operation) {
+  if (!enabled) return db.transaction(operation).immediate();
+  const start = performance.now();
+  let entered;
+  let finished;
+  let outcome = "error";
+  try {
+    const result = db.transaction(() => {
+      entered = performance.now();
+      try { return operation(); }
+      finally { finished = performance.now(); }
+    }).immediate();
+    outcome = "ok";
+    return result;
+  } finally {
+    const end = performance.now();
+    if (end - start >= 100) {
+      require("../utils/logger").warn(`[WalletSqliteTiming] phase=${phase} outcome=${outcome}` +
+        ` beginMs=${((entered ?? end) - start).toFixed(2)}` +
+        ` bodyMs=${(entered === undefined ? 0 : finished - entered).toFixed(2)}` +
+        ` finishMs=${(finished === undefined ? 0 : end - finished).toFixed(2)}`);
+    }
+  }
+}
+
+function enqueuePersistenceOperations(batches, ownerFence) {
+  const db = requireWritableDb();
+  const normalized = batches.map(({ table, upserts, deletes }) => ({
+    table: normalizePersistenceTable(table),
+    upserts: validatePersistenceUpserts(upserts),
+    deletes: validatePersistenceDeletes(deletes),
+  }));
   const createdAt = new Date().toISOString();
   const requestedFence = resolvePersistenceOwnerFence(ownerFence);
 
-  const enqueue = requireDb().transaction(() => {
+  const operations = runWalletTimedTransaction(db, "enqueue", !db.inTransaction &&
+    normalized.some(batch => batch.table === "walletAuthorityState"), () => {
     const fence = assertActivePersistenceOwner(requestedFence);
-    // Creation and journal insertion share the fenced transaction. A stale
-    // owner cannot publish even an empty table before its enqueue is rejected.
-    createSqlTable(normalizedTable);
-    const result = requireDb()
-      .prepare(
-        `INSERT INTO _persistence_outbox(
-           table_name, owner_role, owner_epoch, owner_instance_id,
-           upserts_json, deletes_json, state, created_at, applied_at
-         ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL)`,
-      )
-      .run(
-        normalizedTable,
+    const insert = db.prepare(
+      `INSERT INTO _persistence_outbox(
+         table_name, owner_role, owner_epoch, owner_instance_id,
+         upserts_json, deletes_json, state, created_at, applied_at
+       ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL)`,
+    );
+    return normalized.map(({ table, upserts, deletes }) => {
+      // A stale owner cannot create even an empty table. The table and its
+      // replayable operation are published in the same fenced transaction.
+      createSqlTable(table);
+      const result = insert.run(
+        table,
         fence.ownerRole,
         fence.epoch,
         fence.instanceId,
-        JSON.stringify(normalizedUpserts),
-        JSON.stringify(normalizedDeletes),
+        JSON.stringify(upserts),
+        JSON.stringify(deletes),
         createdAt,
       );
-    const operationId = normalizePersistenceOperationId(result.lastInsertRowid);
-    return {
-      operationId,
-      table: normalizedTable,
-      ownerRole: fence.ownerRole,
-      ownerEpoch: fence.epoch,
-      ownerInstanceId: fence.instanceId,
-      upserts: normalizedUpserts,
-      deletes: normalizedDeletes,
-      state: "pending",
-      createdAt,
-      appliedAt: null,
-    };
+      return {
+        operationId: normalizePersistenceOperationId(result.lastInsertRowid),
+        table,
+        ownerRole: fence.ownerRole,
+        ownerEpoch: fence.epoch,
+        ownerInstanceId: fence.instanceId,
+        upserts,
+        deletes,
+        state: "pending",
+        createdAt,
+        appliedAt: null,
+      };
+    });
   });
-  const operation = enqueue.immediate();
-  ensuredTables.add(normalizedTable);
-  return operation;
+  for (const { table } of operations) {
+    ensuredTables.add(table);
+  }
+  return operations;
 }
 
-function applyChangeStatements(table, upserts, deletes) {
+// A row the schema refuses (a CHECK, a key the typed view does not
+// recognize, a field of the wrong shape) can never be applied, however often
+// its batch is retried. Disk, lock and I/O errors are not refusals.
+function isRowRefusal(error) {
+  return Boolean(error) && typeof error.code === "string" &&
+    /^SQLITE_(CONSTRAINT|MISMATCH)/.test(error.code);
+}
+
+let rejectedRowsListener = null;
+
+// The main thread logs every set-aside row once. The worker records rows but
+// has no listener; the main thread reports them when it acknowledges the batch.
+function onRejectedRows(listener) {
+  rejectedRowsListener = typeof listener === "function" ? listener : null;
+}
+
+function rejectedRowsTableExists() {
+  return Boolean(requireDb()
+    .prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_persistence_rejected_rows'")
+    .get());
+}
+
+// Created on the first refusal, inside the write transaction that needs it.
+function ensureRejectedRowsTable() {
+  requireDb().exec(`
+    CREATE TABLE IF NOT EXISTS _persistence_rejected_rows (
+      rejection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation_id INTEGER NOT NULL,
+      table_name TEXT NOT NULL,
+      row_key TEXT NOT NULL,
+      change_kind TEXT NOT NULL CHECK (change_kind IN ('upsert', 'delete')),
+      row_json TEXT,
+      error TEXT NOT NULL,
+      rejected_at TEXT NOT NULL,
+      reported INTEGER NOT NULL DEFAULT 0 CHECK (reported IN (0, 1)),
+      UNIQUE (operation_id, table_name, row_key, change_kind)
+    )
+  `);
+}
+
+function reportRejectedRows(rows) {
+  if (!rejectedRowsListener || rows.length === 0) return false;
+  try {
+    rejectedRowsListener(rows.map((row) => ({ ...row })));
+  } catch (_error) {
+    // Reporting must never undo the save that set the rows aside.
+  }
+  return true;
+}
+
+function recordRejectedRows(table, operationId, rejected) {
+  ensureRejectedRowsTable();
+  const rejectedAt = new Date().toISOString();
+  const reported = reportRejectedRows(rejected.map((row) => ({ ...row, table, operationId })));
+  const insert = requireDb().prepare(
+    `INSERT OR IGNORE INTO _persistence_rejected_rows (
+       operation_id, table_name, row_key, change_kind, row_json, error, rejected_at, reported
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const row of rejected) {
+    insert.run(operationId, table, row.key, row.kind, row.json, row.error, rejectedAt, reported ? 1 : 0);
+  }
+}
+
+// Reports, once, the rows the worker set aside for this batch.
+function reportUnreportedRejectedRows(operationId) {
+  if (!rejectedRowsListener || !rejectedRowsTableExists()) return;
+  const rows = requireDb().prepare(
+    `SELECT table_name, row_key, change_kind, row_json, error FROM _persistence_rejected_rows
+     WHERE operation_id = ? AND reported = 0 ORDER BY rejection_id`,
+  ).all(operationId);
+  if (rows.length === 0) return;
+  reportRejectedRows(rows.map((row) => ({
+    table: row.table_name, operationId, key: row.row_key, kind: row.change_kind, json: row.row_json, error: row.error,
+  })));
+  requireDb().prepare("UPDATE _persistence_rejected_rows SET reported = 1 WHERE operation_id = ? AND reported = 0")
+    .run(operationId);
+}
+
+// Applies one batch inside the caller's transaction. With `setAside`, a batch
+// the schema refuses is applied row by row instead: every row that applies is
+// saved, and every refused row is recorded in _persistence_rejected_rows with
+// its error, so one bad row cannot stop its table, other tables or the next
+// start from saving. Without it, any failure fails the batch.
+function applyChangeStatements(table, upserts, deletes, setAside = null) {
   const upsert = getUpsertStatement(table);
   const remove = getDeleteStatement(table);
-  for (const [key, json] of upserts) {
-    upsert.run(String(key), json);
+  const digests = sharedSchema && TYPED_TABLES.has(table) && hasSubtreeDigests(table);
+  const runUpsert = ([key, json]) => {
+    if (sharedSchema && table === "walletAuthorityState" && tryWriteCorporationCharge(requireDb(), String(key), json)) return;
+    if (digests) upsert.run(String(key), json, subtreeDigests(table, key, json));
+    else upsert.run(String(key), json);
+  };
+  const runDelete = (key) => remove.run(String(key));
+  if (!setAside) {
+    for (const change of upserts) runUpsert(change);
+    for (const key of deletes) runDelete(key);
+    return upserts.length + deletes.length;
   }
-  for (const key of deletes) {
-    remove.run(String(key));
+  // Each nested better-sqlite3 transaction is a savepoint, so a refused
+  // attempt rolls back only itself.
+  const db = requireDb();
+  try {
+    db.transaction(() => {
+      for (const change of upserts) runUpsert(change);
+      for (const key of deletes) runDelete(key);
+    })();
+    return upserts.length + deletes.length;
+  } catch (error) {
+    if (!isRowRefusal(error)) throw error;
   }
-  return upserts.length + deletes.length;
+  const rejected = [];
+  const attempt = (run, key, kind, json) => {
+    try {
+      db.transaction(run)();
+    } catch (error) {
+      if (!isRowRefusal(error)) throw error;
+      rejected.push({ key: String(key), kind, json, error: error.message || String(error) });
+    }
+  };
+  for (const change of upserts) attempt(() => runUpsert(change), change[0], "upsert", change[1]);
+  for (const key of deletes) attempt(() => runDelete(key), key, "delete", null);
+  if (rejected.length) recordRejectedRows(table, setAside.operationId, rejected);
+  return upserts.length + deletes.length - rejected.length;
 }
 
 function applyPersistenceOperation(operationId, expectedTable, ownerFence) {
@@ -1410,6 +1638,7 @@ function applyPersistenceOperation(operationId, expectedTable, ownerFence) {
       operation.table,
       operation.upserts,
       operation.deletes,
+      { operationId: operation.operationId },
     );
     const appliedAt = operation.appliedAt || new Date().toISOString();
     const updated = requireDb()
@@ -1431,6 +1660,60 @@ function applyPersistenceOperation(operationId, expectedTable, ownerFence) {
     };
   });
   return txn.immediate();
+}
+
+function getPersistenceOperationForTable(table, ownerFence) {
+  const fence = assertActivePersistenceOwner(ownerFence);
+  const operation = parsePersistenceOperationRow(requireDb()
+    .prepare(persistenceOperationSelectSql("WHERE table_name = ?"))
+    .get(normalizePersistenceTable(table)));
+  return operation ? assertPersistenceOperationOwner(operation, fence) : null;
+}
+
+function acknowledgeDeferredOperation(table, operationId, ownerFence) {
+  const operation = getPersistenceOperationForTable(table, ownerFence);
+  if (operation?.operationId !== operationId || operation.state !== "applied") return;
+  const acknowledge = requireDb().transaction(() => {
+    const current = getPersistenceOperationForTable(table, ownerFence);
+    if (current?.operationId === operationId && current.state === "applied") {
+      acknowledgePersistenceOperation(operationId, table, ownerFence);
+    }
+  });
+  acknowledge.immediate();
+}
+
+function journalDeferredBatches(batches, ownerFence) {
+  const db = requireWritableDb();
+  // Keep applied rows as proof until the caller accepts the result. If the
+  // worker dies between commit and reply, only the exact same batch may adopt
+  // that proof. The next batch may retire the previous accepted proof itself.
+  const journal = db.transaction(() => {
+    const pending = [];
+    const operations = new Map();
+    for (const batch of batches) {
+      if (batch.previousOperationId) {
+        acknowledgeDeferredOperation(batch.table, batch.previousOperationId, ownerFence);
+      }
+      const existing = getPersistenceOperationForTable(batch.table, ownerFence);
+      if (!existing) {
+        pending.push(batch);
+      } else if (existing.ownerEpoch === ownerFence.epoch &&
+                 existing.ownerInstanceId === ownerFence.instanceId &&
+                 JSON.stringify(existing.upserts) === JSON.stringify(batch.upserts) &&
+                 JSON.stringify(existing.deletes) === JSON.stringify(batch.deletes)) {
+        operations.set(batch.table, existing);
+      } else {
+        throw new Error(`unexpected persistence operation ${existing.operationId} for ${batch.table}`);
+      }
+    }
+    if (pending.length) {
+      for (const operation of enqueuePersistenceOperations(pending, ownerFence)) {
+        operations.set(operation.table, operation);
+      }
+    }
+    return batches.map(({ table }) => operations.get(table));
+  });
+  return journal.immediate();
 }
 
 function acknowledgePersistenceOperation(operationId, expectedTable, ownerFence) {
@@ -1461,6 +1744,7 @@ function acknowledgePersistenceOperation(operationId, expectedTable, ownerFence)
         `failed to acknowledge persistence operation ${operation.operationId}`,
       );
     }
+    reportUnreportedRejectedRows(operation.operationId);
     return operation;
   });
   return txn.immediate();
@@ -1491,7 +1775,7 @@ function reconcilePersistenceOperation(operationId, expectedTable, ownerFence) {
   const normalizedId = normalizePersistenceOperationId(operationId);
   const requestedFence = resolvePersistenceOwnerFence(ownerFence);
   normalizePersistenceTable(expectedTable, "expected persistence table");
-  const txn = requireDb().transaction(() => {
+  return runWalletTimedTransaction(requireDb(), "reconcile", expectedTable === "walletAuthorityState", () => {
     const fence = assertActivePersistenceOwner(requestedFence);
     const operation = getPersistenceOperation(normalizedId, fence);
     if (!operation) {
@@ -1502,6 +1786,7 @@ function reconcilePersistenceOperation(operationId, expectedTable, ownerFence) {
       operation.table,
       operation.upserts,
       operation.deletes,
+      { operationId: operation.operationId },
     );
     const removed = requireDb()
       .prepare(
@@ -1519,7 +1804,6 @@ function reconcilePersistenceOperation(operationId, expectedTable, ownerFence) {
       appliedAt: operation.appliedAt || new Date().toISOString(),
     };
   });
-  return txn.immediate();
 }
 
 function recoverPersistenceOperations(ownerFence) {
@@ -1537,6 +1821,7 @@ function recoverPersistenceOperations(ownerFence) {
         operation.table,
         operation.upserts,
         operation.deletes,
+        { operationId: operation.operationId },
       );
       const appliedAt = operation.appliedAt || new Date().toISOString();
       const updated = requireDb()
@@ -1625,11 +1910,12 @@ function loadRows(table) {
 function existingTableConnection(table) {
   const normalizedTable = normalizePersistenceTable(table);
   const connection = requireDb();
+  const storageType = sharedSchema && TYPED_TABLES.has(normalizedTable) ? "view" : "table";
   const exists = connection
     .prepare(
-      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+      "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?",
     )
-    .get(normalizedTable);
+    .get(storageType, normalizedTable);
   if (!exists) {
     const error = new Error(
       `SQLite table does not exist: ${normalizedTable}`,
@@ -1669,6 +1955,11 @@ function loadExistingTableObject(table) {
   return assembleFromRows(table, parsed);
 }
 
+// Whether SQLite serves this table through a typed view (rows read back by key).
+function isSharedSchemaTable(table) {
+  return sharedSchema && TYPED_TABLES.has(normalizePersistenceTable(table));
+}
+
 function selectPath(value, segments) {
   for (const segment of segments) {
     if (value === null || typeof value !== "object" || !(segment in value)) {
@@ -1686,14 +1977,23 @@ function loadExistingTablePath(table, segments = []) {
   const connection = existingTableConnection(normalizedTable);
   if (segments.length === 0) return { exists: true, value: loadExistingTableObject(normalizedTable) };
   const [first, second] = segments;
+  if (sharedSchema && normalizedTable === "characters" && segments.length === 2 &&
+      second === "standingOperationReceipts") {
+    const row = connection.prepare(`SELECT record.character_standing_receipts_kind AS kind,
+      (SELECT json_group_object(receipt.member_key, json(receipt.json) ORDER BY receipt.member_order)
+        FROM character_standing_receipts_legacy_rows AS receipt WHERE receipt.parent_id = record.row_id) AS receipts
+      FROM character_records AS record WHERE record.legacy_key = ?`).get(first);
+    if (row?.kind === 'object') return { exists: true, value: JSON.parse(row.receipts) };
+  }
   const groups = rowGroupsFor(normalizedTable) || [];
   const readRow = (key) => connection.prepare(`SELECT json FROM "${normalizedTable}" WHERE key = ?`).get(key);
   if (groups.includes(first)) {
     if (segments.length === 1) {
       const rows = {};
       const prefix = `${first}${ROW_KEY_SEP}`;
+      const order = sharedSchema && TYPED_TABLES.has(normalizedTable) ? "key" : "rowid";
       for (const row of connection.prepare(
-        `SELECT key, json FROM "${normalizedTable}" WHERE key = ? OR (key >= ? AND key < ?) ORDER BY rowid`,
+        `SELECT key, json FROM "${normalizedTable}" WHERE key = ? OR (key >= ? AND key < ?) ORDER BY ${order}`,
       ).all(first, prefix, `${first} `)) rows[row.key] = JSON.parse(row.json);
       return selectPath(assembleFromRows(normalizedTable, rows), segments);
     }
@@ -1723,6 +2023,18 @@ function loadExistingIncursionPending(table, instanceID) {
   if (!group) throw new Error("unsupported incursion outcome table");
   const connection = existingTableConnection(table);
   const scope = instanceID ?? null;
+  if (sharedSchema) {
+    const prefix = table === "items" ? "inventory_incursion_combat" : "npc_incursion_combat";
+    const pending = "receipt.format_version = 1 AND receipt.acknowledged IS NOT 1";
+    const projection = `JOIN ${prefix}_receipts_legacy_rows AS projected USING (legacy_key)`;
+    const rows = scope === null
+      ? connection.prepare(`SELECT projected.json FROM ${prefix}_receipts AS receipt
+          ${projection} WHERE ${pending} ORDER BY receipt.legacy_key`).all()
+      : connection.prepare(`SELECT projected.json FROM ${prefix}_events AS event
+          JOIN ${prefix}_receipts AS receipt ON receipt.row_id = event.parent_id
+          ${projection} WHERE event.instance_id = ? AND ${pending} ORDER BY receipt.legacy_key`).all(scope);
+    return rows.map(row => JSON.parse(row.json));
+  }
   return connection.transaction(() => {
     const legacy = connection.prepare(`SELECT json FROM "${table}" WHERE key = ?`).get(group);
     // Merge legacy and split rows before filtering so an acknowledged split
@@ -1748,6 +2060,36 @@ function loadExistingCareerRows(table, characterID) {
   const connection = existingTableConnection(table);
   const id = Number(characterID);
   if (!Number.isSafeInteger(id) || id <= 0) return {};
+  if (sharedSchema && table === "items") {
+    const rows = connection.prepare(`SELECT receipt.legacy_key, projected.json
+      FROM inventory_career_combat_receipts AS receipt
+      JOIN inventory_career_combat_receipts_legacy_rows AS projected USING (legacy_key)
+      WHERE receipt.character_id = ? AND receipt.acknowledged IS NOT 1 ORDER BY receipt.row_id`).all(id);
+    return Object.fromEntries(rows.map(row => [
+      row.legacy_key.slice(definition.group.length + 1), JSON.parse(row.json),
+    ]));
+  }
+  if (sharedSchema && table === "industryJobs") {
+    const rows = connection.prepare(`SELECT job.job_key, projected.json
+      FROM industry_jobs AS job JOIN industry_jobs_legacy_rows AS projected USING (legacy_key)
+      WHERE job.installer_id = ? ORDER BY job.row_id`).all(id);
+    return Object.fromEntries(rows.map(row => [String(row.job_key), JSON.parse(row.json)]));
+  }
+  if (sharedSchema && table === "killmails") {
+    const rows = connection.prepare(`WITH matches AS MATERIALIZED (
+      SELECT row_id, legacy_key FROM killmail_records WHERE final_character_id = ?
+      UNION ALL
+      SELECT row_id, legacy_key FROM killmail_records
+        WHERE typeof(final_character_value) = 'text' AND final_character_id IS NOT ?
+    )
+    SELECT matches.legacy_key, projected.json
+      FROM matches JOIN killmail_records_legacy_rows AS projected USING (legacy_key)
+      ORDER BY matches.row_id`).all(id, id);
+    const records = rows.map(row => [
+      row.legacy_key.slice(definition.group.length + 1), JSON.parse(row.json),
+    ]).filter(([, record]) => Number(record.finalCharacterID) === id);
+    return Object.fromEntries(records);
+  }
   return connection.transaction(() => {
     const groupRow = connection.prepare(`SELECT json FROM "${table}" WHERE key = ?`).get(definition.group);
     const legacy = groupRow ? JSON.parse(groupRow.json) : null;
@@ -1776,6 +2118,25 @@ function loadExistingCareerRows(table, characterID) {
 }
 
 function loadAbyssalInstancesInSnapshot(connection, characterID) {
+  const id = Number(characterID);
+  if (sharedSchema && TYPED_TABLES.has("dungeonRuntimeState")) {
+    const pilot = Number.isSafeInteger(id) && id > 0 ? id : null;
+    const rows = connection.prepare(`
+      SELECT instance.instance_id, projected.json
+      FROM dungeon_instances AS instance JOIN dungeon_instances_legacy_rows AS projected USING (legacy_key)
+      WHERE instance.site_family = 'abyssal' AND instance.site_kind = 'abyssal-pocket'
+        AND (? IS NULL OR EXISTS (
+          SELECT 1 FROM dungeon_environment_state AS environment
+          JOIN dungeon_abyssal_state AS runtime ON runtime.parent_id = environment.row_id
+          JOIN dungeon_abyssal_pockets AS pocket ON pocket.parent_id = runtime.row_id
+          JOIN dungeon_abyssal_participants AS participant ON participant.parent_id = pocket.row_id
+          WHERE environment.parent_id = instance.row_id AND participant.character_id = ?
+        ))
+      ORDER BY instance.legacy_key
+    `).all(pilot, pilot);
+    return Object.fromEntries(rows.map(row => [row.instance_id, JSON.parse(row.json)]));
+  }
+
   const groupRow = connection.prepare('SELECT json FROM "dungeonRuntimeState" WHERE key = ?').get("instancesByID");
   const legacy = groupRow ? JSON.parse(groupRow.json) : null;
   let instances;
@@ -1790,7 +2151,6 @@ function loadAbyssalInstancesInSnapshot(connection, characterID) {
     ).all()) instances[row.key.slice(DUNGEON_INSTANCE_PREFIX.length)] = JSON.parse(row.json);
   }
   const selected = {};
-  const id = Number(characterID);
   for (const [key, instance] of Object.entries(instances)) {
     if (instance?.siteFamily !== "abyssal" || instance?.siteKind !== "abyssal-pocket") continue;
     if (Number.isSafeInteger(id) && id > 0) {
@@ -1900,6 +2260,7 @@ function close() {
   db = null;
   dbPath = null;
   dbReadOnly = false;
+  sharedSchema = false;
   ensuredTables.clear();
   upsertStatements.clear();
   deleteStatements.clear();
@@ -1908,6 +2269,9 @@ function close() {
 
 module.exports = {
   init,
+  disableWalAutoCheckpoint,
+  onRejectedRows,
+  reportRejectedRows,
   ensureSqlTable,
   isMigrated,
   markMigrated,
@@ -1924,6 +2288,8 @@ module.exports = {
   ensureDungeonReadIndexes,
   explodeToRows,
   assembleFromRows,
+  isSharedSchemaTable,
+  selectPath,
   rowValueForKey,
   rowGroupsFor,
   ROW_KEY_SEP,
@@ -1939,7 +2305,10 @@ module.exports = {
   adoptLegacyPersistenceOperations,
   enqueuePersistenceOperation,
   commitSynchronousChanges,
+  enqueuePersistenceOperations,
   getPersistenceOperation,
+  journalDeferredBatches,
+  acknowledgeDeferredOperation,
   listPersistenceOperations,
   listAllPersistenceOperations,
   assertNoForeignPersistenceOperations,

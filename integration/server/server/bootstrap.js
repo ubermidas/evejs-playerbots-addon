@@ -48,14 +48,8 @@ const log = require(path.join(__dirname, "./src/utils/logger"));
 const {
   initializeContentPacks,
 } = require(path.join(__dirname, "./src/contentPacks/contentPackManager"));
-const {
-  describeSyncResult,
-  syncStaticTables,
-} = require(path.join(__dirname, "./src/gameStore/syncStaticTables"));
-const {
-  applySovereigntyResetAtStartup,
-  logSovereigntyResetState,
-} = require(path.join(__dirname, "./src/services/sovereignty/sovResetMarker"));
+const { validateInstalledStaticData } = require(path.join(__dirname, "./src/gameStore/staticDataBuild"));
+const { resolveDataDir, resolveStoreRoot } = require(path.join(__dirname, "./src/gameStore/storeRoot"));
 const {
   autoInstallContentPacks,
   describeAutoInstall,
@@ -119,16 +113,13 @@ const {
 const PRODUCTION_STAGES = {
   installLifecycleLogging: true,
   logBanner: true,
-  syncStaticTables: true,
+  validateStaticTables: true,
   // Syncs the content-packs/ drop folder into the store. A store that already
   // has its packs installed does not need it, and it is by far the most
   // expensive stage (measured at 54.9 s of a 65.2 s boot), so the harness
   // turns it off and loads the registry the store already carries.
   installContentPacks: true,
   preloadDatabase: true,
-  // The one-time retail-parity sovereignty reset. Runs only with
-  // preloadDatabase, and does nothing once the store carries its marker.
-  resetSovereignty: true,
   ensureCoreFixtures: true,
   resetAsteroidBelts: true,
   registerServices: true,
@@ -290,18 +281,13 @@ async function bootWorld(options = {}) {
     logStartupBanner();
   }
 
-  // A store is generated once and then kept, so its static tables drift from the
-  // installed release: a table a later release adds is absent, and one a later
-  // release changes stays stale. Both have broken a release. Reconcile before
-  // anything reads one -- the content-pack merge on the line below is what fails
-  // otherwise, with CONTENT_PACK_DUNGEON_BASE_UNAVAILABLE for the first and
-  // CONTENT_PACK_TEMPLATE_CONFLICT for the second.
-  if (stages.syncStaticTables) {
-    const staticTableSync = syncStaticTables();
-    const staticTableSyncSummary = describeSyncResult(staticTableSync);
-    if (staticTableSyncSummary) {
-      log.info(`[GameStore] ${staticTableSyncSummary}`);
-    }
+  if (stages.validateStaticTables) {
+    validateInstalledStaticData({
+      storeRoot: resolveStoreRoot(),
+      dataDir: resolveDataDir(),
+      expectedBuild: CLIENT_COMPATIBILITY_PROFILE.clientBuild,
+      expectedSdeBuild: require("./src/gameStore/releaseBuilds").RELEASE_SDE_BUILD,
+    });
   }
 
   // The release ships its content packs in content-packs/ and the server installs
@@ -345,17 +331,6 @@ async function bootWorld(options = {}) {
   // Preload database into memory before services initialize
   if (stages.preloadDatabase) {
     database.preloadAll();
-    // Old sovereignty data (TCU claims, empty claims) is never repaired. The
-    // one-time reset removes it, after a backup, and leaves a marker. It runs
-    // here, before any service, scene or durable owner reads sovereignty, and
-    // a failure stops startup. With the setting off the server only reports.
-    if (stages.resetSovereignty) {
-      if (config.sovereigntyOneTimeParityReset === true) {
-        await applySovereigntyResetAtStartup(log, database);
-      } else {
-        logSovereigntyResetState(log, database);
-      }
-    }
     // Repair published courier wraps before any inventory listener can expose
     // their legacy quantity. Each repair is durably fenced by the contract
     // owner; incomplete escrow evidence is left untouched and reported.
@@ -559,7 +534,12 @@ async function bootWorld(options = {}) {
   };
 
   try {
+    const { pruneLegacyMarketTransactions } = require("./src/services/account/walletMarketTransactionRetention");
+    const legacyMarketEntriesRemoved = pruneLegacyMarketTransactions();
     const walletResult = await productionWalletAuthorityRuntime.start();
+    if (legacyMarketEntriesRemoved > 0) {
+      log.info(`[WalletAuthority] Removed ${legacyMarketEntriesRemoved} expired legacy wallet market transaction(s).`);
+    }
     log.info(
       `[WalletAuthority] Process owner ready after flushing ${walletResult.preflightTables} parent table(s).`,
     );

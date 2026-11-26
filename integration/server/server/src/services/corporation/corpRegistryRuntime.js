@@ -1,5 +1,9 @@
 "use strict";
 
+const autoRemoval = require("./corpAutoRemoval");
+const { findSessionByCharacterID } = require("../chat/sessionRegistry");
+const { isDockedSession } = require("../structure/structureLocation");
+
 const path = require("path");
 const { PROXY_NODE_ID } = require(path.join(__dirname, "../../network/protocolProfile"));
 
@@ -158,6 +162,9 @@ const {
 const {
   listKillmailsForCorporation,
 } = require(path.join(__dirname, "../killmail/killmailState"));
+const {
+  projectKillmailWireDamage,
+} = require(path.join(__dirname, "../killmail/killmailPreparationTasks"));
 const {
   sendCorporationWelcomeMailToCharacter,
 } = require(path.join(__dirname, "../mail/mailState"));
@@ -632,6 +639,13 @@ function resolveFallbackCorporationID(characterID) {
   return DEFAULT_NPC_CORPORATION_ID;
 }
 
+function hasRequiredMilitiaStanding(characterID, corporationID) {
+  const corporation = getCorporationRecord(corporationID);
+  if (!corporation || corporation.isNPC) return true;
+  const factionID = require("./fwCharacterEnlistmentMgrService").getPersistedCorporationFactionID(corporationID);
+  return !factionID || require("../character/standingRuntime").getCharacterRawStanding(characterID, factionID) >= -5;
+}
+
 function moveCharacterToCorporation(
   characterID,
   fromCorporationID,
@@ -646,6 +660,9 @@ function moveCharacterToCorporation(
     };
   }
   const sourceCorporation = getCorporationRecord(fromCorporationID) || {};
+  if (Number(fromCorporationID) !== Number(toCorporationID) && !hasRequiredMilitiaStanding(characterID, toCorporationID)) {
+    return { success: false, errorMsg: "FW_MEMBER_STANDING_TOO_LOW" };
+  }
   const sourceIsNpcCorporation =
     Boolean(sourceCorporation.isNPC) ||
     Number(fromCorporationID) === Number(DEFAULT_NPC_CORPORATION_ID);
@@ -666,6 +683,7 @@ function moveCharacterToCorporation(
     characterID,
     targetCorporation.corporationID,
     targetCorporation.allianceID || null,
+    { durable: options.durable === true },
   );
   if (!affiliationResult.success) {
     return affiliationResult;
@@ -952,6 +970,11 @@ function validateAllianceApplicationEligibility(corporationID, allianceID) {
   const result = checkAllianceApplicationEligibility(corporationID, allianceID);
   if (result && result.success) {
     return result.data;
+  }
+  if (result?.errorMsg === "FW_MEMBER_STANDING_TOO_LOW") {
+    throwWrappedUserError("CustomNotify", {
+      notify: "Every member of the applicant corporation must have raw faction standing of at least -5 to join this enlisted alliance.",
+    });
   }
   const errorName = result && result.errorMsg === "AGGRESSOR_WAR"
     ? "CanNotJoinAllianceWhileAgressor"
@@ -1814,33 +1837,36 @@ function buildLabelRowValues(labelID, label) {
 function buildKillmailRows(records = []) {
   return buildDbRowset(
     KILLMAIL_DBROW_COLUMNS,
-    records.map((record) => [
-      Number(record && record.killID) || 0,
-      normalizePositiveInteger(record && record.solarSystemID, null),
-      normalizePositiveInteger(record && record.victimCharacterID, null),
-      normalizePositiveInteger(record && record.victimCorporationID, null),
-      normalizePositiveInteger(record && record.victimAllianceID, null),
-      normalizePositiveInteger(record && record.victimFactionID, null),
-      normalizePositiveInteger(record && record.victimShipTypeID, null),
-      normalizePositiveInteger(record && record.finalCharacterID, null),
-      normalizePositiveInteger(record && record.finalCorporationID, null),
-      normalizePositiveInteger(record && record.finalAllianceID, null),
-      normalizePositiveInteger(record && record.finalFactionID, null),
-      normalizePositiveInteger(record && record.finalShipTypeID, null),
-      normalizePositiveInteger(record && record.finalWeaponTypeID, null),
-      normalizeText(record && record.killBlob, ""),
-      buildFiletimeLong(record && record.killTime ? record.killTime : currentFileTime()),
-      Math.max(0, normalizeInteger(record && record.victimDamageTaken, 0)),
-      Number(record && record.finalSecurityStatus) || 0,
-      Math.max(0, normalizeInteger(record && record.finalDamageDone, 0)),
-      normalizePositiveInteger(record && record.moonID, null),
-      normalizePositiveInteger(record && record.warID, null),
-      Number(record && record.iskLost) || 0,
-      Number(record && record.bountyClaimed) || 0,
-      normalizeInteger(record && record.loyaltyPoints, 0),
-      Number(record && record.iskDestroyed) || 0,
-      normalizePositiveInteger(record && record.killRightSupplied, null),
-    ]),
+    records.map((record) => {
+      const damage = projectKillmailWireDamage(record || {});
+      return [
+        Number(record && record.killID) || 0,
+        normalizePositiveInteger(record && record.solarSystemID, null),
+        normalizePositiveInteger(record && record.victimCharacterID, null),
+        normalizePositiveInteger(record && record.victimCorporationID, null),
+        normalizePositiveInteger(record && record.victimAllianceID, null),
+        normalizePositiveInteger(record && record.victimFactionID, null),
+        normalizePositiveInteger(record && record.victimShipTypeID, null),
+        normalizePositiveInteger(record && record.finalCharacterID, null),
+        normalizePositiveInteger(record && record.finalCorporationID, null),
+        normalizePositiveInteger(record && record.finalAllianceID, null),
+        normalizePositiveInteger(record && record.finalFactionID, null),
+        normalizePositiveInteger(record && record.finalShipTypeID, null),
+        normalizePositiveInteger(record && record.finalWeaponTypeID, null),
+        damage.killBlob,
+        buildFiletimeLong(record && record.killTime ? record.killTime : currentFileTime()),
+        damage.victimDamageTaken,
+        Number(record && record.finalSecurityStatus) || 0,
+        damage.finalDamageDone,
+        normalizePositiveInteger(record && record.moonID, null),
+        normalizePositiveInteger(record && record.warID, null),
+        Number(record && record.iskLost) || 0,
+        Number(record && record.bountyClaimed) || 0,
+        normalizeInteger(record && record.loyaltyPoints, 0),
+        Number(record && record.iskDestroyed) || 0,
+        normalizePositiveInteger(record && record.killRightSupplied, null),
+      ];
+    }),
     "carbon.common.script.sys.crowset.CRowset",
   );
 }
@@ -2543,6 +2569,15 @@ class CorpRegistryRuntimeService extends BaseService {
         });
       }
     }
+    if (
+      status === APP_STATUS_ACCEPTED_BY_CHARACTER &&
+      currentCorporationID !== corporationID &&
+      !hasRequiredMilitiaStanding(applicantID, corporationID)
+    ) {
+      throwWrappedUserError("CustomNotify", {
+        notify: "Your raw faction standing must be at least -5 to join this enlisted corporation.",
+      });
+    }
     let joinedCharacterID = null;
     let nextApplicationRow = null;
     let applicationFound = false;
@@ -2628,6 +2663,13 @@ class CorpRegistryRuntimeService extends BaseService {
       );
       if (moveResult.success) {
         archiveAllActiveApplicationsForCharacter(joinedCharacterID, applicationID);
+        // Join a Corporation: a capsuleer-run corporation newly joined, receipted by the application.
+        try {
+          if (Number(currentCorporationID) !== Number(corporationID) && !isNpcCorporationID(corporationID)) {
+            require("../achievement/achievementRuntime")
+              .recordCorporationJoined(joinedCharacterID, corporationID, applicationID);
+          }
+        } catch (_) { /* achievement bookkeeping is best effort */ }
       }
     }
     if (applicationFound && status === APP_STATUS_ACCEPTED_BY_CHARACTER) {
@@ -3017,8 +3059,7 @@ class CorpRegistryRuntimeService extends BaseService {
     if (!canAdministerCorporation(resolveCorporationID(session), session)) {
       throwCorporationAccessDenied();
     }
-    const runtime = getCorporationRuntime(resolveCorporationID(session)) || {};
-    return buildList((runtime.pendingAutoKicks || []).map((entry) => entry));
+    return buildList(autoRemoval.getPendingRows(resolveCorporationID(session)));
   }
 
   Handle_GetMemberIDsByQuery(args, session) {
@@ -3245,9 +3286,24 @@ class CorpRegistryRuntimeService extends BaseService {
     if (companyShares && !canAdministerCorporation(fromShareholderID, session)) {
       throwCorporationAccessDenied();
     }
+    // Shares go to an existing character or corporation. A missing or unknown
+    // recipient would park them under a key nobody can vote or be paid for.
+    const recipientCharacter = toShareholderID && peekCharacterRecord(toShareholderID);
+    const recipientIsCharacter = Boolean(
+      recipientCharacter && !recipientCharacter.isDeleted && !recipientCharacter.deletedAt,
+    );
+    const recipientCorporation = !recipientIsCharacter && toShareholderID &&
+      getCorporationRecord(toShareholderID);
+    if (!recipientIsCharacter && (!recipientCorporation || recipientCorporation.deleted)) {
+      throwCorporationAccessDenied();
+    }
+    if (numberOfShares <= 0) {
+      return null;
+    }
     const previousShares = (getCorporationRuntime(corporationID) || {}).shares || {};
     const updateResult = updateCorporationRuntime(corporationID, (runtime) => {
-      const currentFrom = Number((runtime.shares || {})[String(fromShareholderID)] || 0);
+      runtime.shares = runtime.shares || {};
+      const currentFrom = Number(runtime.shares[String(fromShareholderID)] || 0);
       const moved = Math.min(currentFrom, numberOfShares);
       runtime.shares[String(fromShareholderID)] = currentFrom - moved;
       runtime.shares[String(toShareholderID)] =
@@ -3914,15 +3970,8 @@ class CorpRegistryRuntimeService extends BaseService {
   Handle_CanBeKickedOut(args, session) {
     const corporationID = resolveCorporationID(session);
     const characterID = normalizePositiveInteger(args && args[0], null);
-    const corporation = getCorporationRecord(corporationID);
-    const member = getCorporationMember(corporationID, characterID);
-    if (!corporation || !member) {
-      return 0;
-    }
-    if (Number(corporation.ceoID) === Number(characterID) || member.isCEO) {
-      return 0;
-    }
-    return memberHasActiveRoles(member) || memberIsInRoleStasis(member) ? 0 : 1;
+    return canRemoveCorporationMember(corporationID, characterID) &&
+      !getAboveAverageShareholderIDs(corporationID).has(characterID) ? 1 : 0;
   }
 
   Handle_KickOutMember(args, session) {
@@ -3930,6 +3979,21 @@ class CorpRegistryRuntimeService extends BaseService {
     const characterID = normalizePositiveInteger(args && args[0], null);
     const actingCharacterID = resolveCharacterID(session, []);
     const isSelf = Number(characterID) === Number(actingCharacterID);
+    if (isSelf && getCorporationRecord(corporationID)?.isNPC) {
+      const character = requireSessionCharacter(session);
+      if (Number(character.corporationID) !== corporationID) throwCorporationAccessDenied();
+      if (character.directFactionID) {
+        return new (require("./fwCharacterEnlistmentMgrService"))().Handle_RemoveMyDirectEnlistment([], session);
+      }
+    }
+    // enlistmentUtil.Retire calls this on the pilot's own NPC militia.
+    if (isSelf && require("../faction/factionWarfareAuthority").getFactionIDForMilitiaCorporationID(corporationID)) {
+      const character = requireSessionCharacter(session);
+      if (Number(character.corporationID) !== corporationID) throwCorporationAccessDenied();
+      const result = moveCharacterToCorporation(characterID, corporationID, resolveFallbackCorporationID(characterID));
+      if (!result?.success) throwWrappedUserError("CustomNotify", { notify: "Failed to save militia retirement." });
+      return null;
+    }
     if (!hasPersistedCorporationMembership(corporationID, session)) {
       throwCorporationAccessDenied();
     }
@@ -3944,14 +4008,14 @@ class CorpRegistryRuntimeService extends BaseService {
     if (!isSelf && !this.Handle_CanBeKickedOut([characterID], session)) {
       return null;
     }
-    const result = moveCharacterToCorporation(
-      characterID,
-      corporationID,
-      resolveFallbackCorporationID(characterID),
-    );
-    if (result && result.success) {
-      // CorpKicked (92): tell the removed member they were kicked.
-      notifyCorporationMemberKicked(corporationID, characterID);
+    if (isSelf) {
+      const result = moveCharacterToCorporation(characterID, corporationID, resolveFallbackCorporationID(characterID));
+      if (result?.success) notifyCorporationMemberKicked(corporationID, characterID);
+    } else {
+      const result = expelCorporationMember(corporationID, characterID, actingCharacterID);
+      if (!result.success) {
+        throwWrappedUserError("CustomNotify", { notify: "Could not save corporation member removal." });
+      }
     }
     // base_corporation.KickOut / corp_ui_home.ResignFromCorp use the session
     // change and notices; the internal affiliation result is not a wire value.
@@ -3977,15 +4041,9 @@ class CorpRegistryRuntimeService extends BaseService {
         notKicked.push(Number(characterID));
         continue;
       }
-      const result = moveCharacterToCorporation(
-        characterID,
-        corporationID,
-        resolveFallbackCorporationID(characterID),
-      );
-      if (result.success) {
+      const result = expelCorporationMember(corporationID, characterID, actingCharacterID);
+      if (result.success && !result.queued) {
         kicked.push(Number(characterID));
-        // CorpKicked (92): tell each removed member they were kicked.
-        notifyCorporationMemberKicked(corporationID, characterID);
       } else {
         notKicked.push(Number(characterID));
       }
@@ -4000,24 +4058,10 @@ class CorpRegistryRuntimeService extends BaseService {
   Handle_GetMemberIDsWithMoreThanAvgShares(args, session) {
     const corporationID = resolveCorporationID(session);
     requireCorporationReadAccess(corporationID, session);
-    const runtime = getCorporationRuntime(corporationID) || {};
-    const members = listCorporationMembers(corporationID);
-    if (!members.length) {
-      return buildList([]);
-    }
-    const totalShares = Number(
-      (runtime.shares && runtime.shares[String(corporationID)]) || 0,
-    );
-    const averageShares = totalShares / members.length;
-    return buildList(
-      members
-        .filter(
-          (member) =>
-            Number((runtime.shares || {})[String(member.characterID)] || 0) >
-            averageShares,
-        )
-        .map((member) => member.characterID),
-    );
+    const protectedShareholders = getAboveAverageShareholderIDs(corporationID);
+    return buildList(listCorporationMembers(corporationID)
+      .map((member) => Number(member.characterID))
+      .filter((characterID) => protectedShareholders.has(characterID)));
   }
 
   Handle_ResignFromCEO(args, session) {
@@ -4253,4 +4297,84 @@ class CorpRegistryRuntimeService extends BaseService {
   }
 }
 
+function expelCorporationMember(corporationID, characterID, actingCharacterID, { sanctioned = false } = {}) {
+  const character = peekCharacterRecord(characterID);
+  const member = getCorporationMember(corporationID, characterID);
+  if (!character || character.isDeleted || character.deletedAt ||
+      Number(character.corporationID) !== corporationID || !member ||
+      !canRemoveCorporationMember(corporationID, characterID) ||
+      (!sanctioned && getAboveAverageShareholderIDs(corporationID).has(characterID))) {
+    return { success: false, errorMsg: "CORPORATION_MEMBER_NOT_ELIGIBLE" };
+  }
+  const online = findSessionByCharacterID(characterID);
+  if (autoRemoval.getPendingRemovalForMember(corporationID, member) ||
+      (online && !isDockedSession(online) && (online._space || Number(online.solarsystemid) > 0))) {
+    return autoRemoval.queueRemoval(corporationID, member, actingCharacterID, sanctioned);
+  }
+  return completeCorporationExpulsion(corporationID, characterID);
+}
+
+function completeCorporationExpulsion(corporationID, characterID, durable = false) {
+  const result = moveCharacterToCorporation(
+    characterID, corporationID, resolveFallbackCorporationID(characterID), { durable },
+  );
+  if (result.success) notifyCorporationMemberKicked(corporationID, characterID);
+  return result;
+}
+
+function applyPendingAutoRemoval(corporationID, entry) {
+  const { characterID } = entry;
+  const character = peekCharacterRecord(characterID);
+  const member = getCorporationMember(corporationID, characterID);
+  if (!character || character.isDeleted || character.deletedAt ||
+      Number(character.corporationID) !== corporationID || !member ||
+      String(member.startDate) !== entry.memberStartDate ||
+      !canRemoveCorporationMember(corporationID, characterID) ||
+      (!entry.sanctioned && getAboveAverageShareholderIDs(corporationID).has(characterID))) {
+    return { success: true, stale: true };
+  }
+  return completeCorporationExpulsion(corporationID, characterID, true);
+}
+
+function canRemoveCorporationMember(corporationID, characterID) {
+  const corporation = getCorporationRecord(corporationID);
+  const member = getCorporationMember(corporationID, characterID);
+  return Boolean(corporation && member &&
+    Number(corporation.ceoID) !== Number(characterID) && !member.isCEO &&
+    !memberHasActiveRoles(member) && !memberIsInRoleStasis(member));
+}
+
+function getAboveAverageShareholderIDs(corporationID) {
+  const holdings = getCorporationRuntime(corporationID)?.shares || {};
+  const ownedShares = new Map();
+  let totalShares = 0;
+  for (const [ownerKey, value] of Object.entries(holdings)) {
+    const ownerID = normalizePositiveInteger(ownerKey, 0);
+    const shares = normalizeInteger(value, 0);
+    if (!ownerID || shares <= 0) continue;
+
+    const character = peekCharacterRecord(ownerID);
+    const ownerCorporation = !character && getCorporationRecord(ownerID);
+    if (character ? character.isDeleted || character.deletedAt : !ownerCorporation || ownerCorporation.deleted) continue;
+
+    ownedShares.set(ownerID, shares);
+    totalShares += shares;
+  }
+  if (ownedShares.size === 0) return new Set();
+
+  // Each positive holding represents one shareholder. Corporate holdings,
+  // including the treasury, can be voted by their CEO and remain their own shares.
+  const averageShares = totalShares / ownedShares.size;
+  return new Set([...ownedShares]
+    .filter(([, shares]) => shares > averageShares)
+    .map(([ownerID]) => ownerID));
+}
+
+CorpRegistryRuntimeService.canRemoveCorporationMember = canRemoveCorporationMember;
+CorpRegistryRuntimeService.expelCorporationMember = expelCorporationMember;
+CorpRegistryRuntimeService.applyPendingAutoRemoval = applyPendingAutoRemoval;
+CorpRegistryRuntimeService.moveCharacterToCorporation = moveCharacterToCorporation;
+CorpRegistryRuntimeService.removeMilitiaMember = function(characterID, corporationID) {
+  return moveCharacterToCorporation(characterID, corporationID, resolveFallbackCorporationID(characterID), { durable: true });
+};
 module.exports = CorpRegistryRuntimeService;

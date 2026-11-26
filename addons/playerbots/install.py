@@ -308,7 +308,7 @@ def node_major() -> int:
     try:
         output = subprocess.run(["node", "--version"], check=True, text=True, stdout=subprocess.PIPE).stdout
     except FileNotFoundError as error:
-        raise RuntimeError("Node.js was not found. Install Node.js 24 or later, the same one EveJS runs on.") from error
+        raise RuntimeError("Node.js was not found. Install Node.js 26 or later, the same one EveJS runs on.") from error
     return int(output.strip().lstrip("v").split(".")[0])
 
 
@@ -364,8 +364,8 @@ def native_direct(target: Path, zip_path: Path, evejs_version: str, remove: bool
     servers started with StartServer.bat or node directly. Game must be
     stopped. Original files are kept in _local/playerbots-native/stock."""
     check_native_target(target, evejs_version)
-    if node_major() < 24:
-        raise RuntimeError("Playerbots needs Node.js 24 or later.")
+    if node_major() < 26:
+        raise RuntimeError("Playerbots needs Node.js 26 or later.")
     home = target / NATIVE_PACKAGE_HOME
     state_path = target / NATIVE_STATE
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else None

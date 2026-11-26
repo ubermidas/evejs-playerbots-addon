@@ -33,13 +33,14 @@ async function loadPinned() {
   pinned.at = Date.now();
   pinned.key = key;
   const rows = new Map();
-  for (const entry of list) {
+  // Pinned pilots load together rather than one after another.
+  await Promise.all(list.map(async (entry) => {
     try {
       rows.set(entry.characterID, await getJSON(`/api/bot?characterID=${entry.characterID}`));
     } catch (error) {
       rows.set(entry.characterID, { characterID: entry.characterID, characterName: entry.characterName, missing: error.status === 404, error: error.message });
     }
-  }
+  }));
   pinned.rows = rows;
 }
 

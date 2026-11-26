@@ -823,6 +823,59 @@ function getStructureTypes() {
   return [...ensureStructureTypes().rows];
 }
 
+// The Ansiblex's jump capacitor (structureJumpBridgeCapacitor.js owns the
+// model). Saved as the charge in GJ at a runtime-clock time, plus an etag the
+// slim item carries so a pilot's panel re-reads the charge, plus the receipts of
+// the operations that spent or gave back charge so a replayed jump settles once.
+// Null means the structure predates the model.
+const JUMP_BRIDGE_CAPACITOR_MAX_RECEIPTS = 64;
+
+function normalizeJumpBridgeCapacitorState(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const chargeGJ = Number(value.chargeGJ);
+  const atMs = toInt(value.atMs, 0);
+  if (!Number.isFinite(chargeGJ) || chargeGJ < 0 || atMs <= 0) {
+    return null;
+  }
+  return {
+    chargeGJ,
+    atMs,
+    etag: Math.max(0, toInt(value.etag, 0)),
+    receipts: (Array.isArray(value.receipts) ? value.receipts : [])
+      .map((receipt) => ({
+        operationID: String(receipt && receipt.operationID || "").trim(),
+        costGJ: Math.max(0, Number.isFinite(Number(receipt && receipt.costGJ)) ? Number(receipt.costGJ) : 0),
+        state: receipt && receipt.state === "refunded" ? "refunded" : "spent",
+      }))
+      .filter((receipt) => receipt.operationID)
+      .slice(-JUMP_BRIDGE_CAPACITOR_MAX_RECEIPTS),
+  };
+}
+
+// A newly created Ansiblex starts with no charge (the 24.02 client's User
+// Manual says so); its clock starts now. Other types, and a record that
+// already carries a state, are left as they are.
+function withInitialJumpBridgeCapacitor(record) {
+  if (
+    !record ||
+    normalizeJumpBridgeCapacitorState(record.jumpBridgeCapacitor) ||
+    !lazyRequire("./structureJumpBridgeLinks").isAnsiblexStructure(record)
+  ) {
+    return record;
+  }
+  return {
+    ...record,
+    jumpBridgeCapacitor: {
+      chargeGJ: 0,
+      atMs: lazyRequire("../../space/runtime/runtimeClock").getWallclockNowMs(),
+      etag: 0,
+      receipts: [],
+    },
+  };
+}
+
 function normalizeStructureRecord(entry = {}) {
   const structureID = toPositiveInt(entry.structureID, 0);
   const typeID = toPositiveInt(entry.typeID, 0);
@@ -915,6 +968,7 @@ function normalizeStructureRecord(entry = {}) {
       : [],
     lowFuelAlertAt: toPositiveInt(entry.lowFuelAlertAt, 0) || null,
     liquidOzoneQty: Math.max(0, toInt(entry.liquidOzoneQty, 0)),
+    jumpBridgeCapacitor: normalizeJumpBridgeCapacitorState(entry.jumpBridgeCapacitor),
     deliveryFuelReceipts: (Array.isArray(entry.deliveryFuelReceipts)
       ? entry.deliveryFuelReceipts
       : [])
@@ -2216,10 +2270,10 @@ function incrementStructureLiquidOzoneIdempotent(
 function createStructure(record, options = {}) {
   const cache = ensureStructureCache();
   const structureID = Math.max(NEXT_STRUCTURE_ID_START, cache.meta.nextStructureID || NEXT_STRUCTURE_ID_START);
-  const next = normalizeStructureRecord({
+  const next = normalizeStructureRecord(withInitialJumpBridgeCapacitor({
     ...record,
     structureID,
-  });
+  }));
   const writeResult = persistStructures([...cache.rows, next], {
     nextStructureID: structureID + 1,
   }, options);
@@ -2292,7 +2346,7 @@ function bindStructureToMoon(structureID, authorityContext, options = {}) {
 }
 
 function upsertStructureRecord(record, options = {}) {
-  const next = normalizeStructureRecord(record || {});
+  let next = normalizeStructureRecord(record || {});
   const structureID = toPositiveInt(next && next.structureID, 0);
   if (!structureID) {
     return createStructure(record, options);
@@ -2302,8 +2356,14 @@ function upsertStructureRecord(record, options = {}) {
   const rows = cache.rows.map((entry) => cloneValue(entry));
   const index = rows.findIndex((entry) => entry.structureID === structureID);
   if (index >= 0) {
+    // A caller's copy of an Ansiblex that carries no capacitor must not erase
+    // the one the structure has.
+    if (!next.jumpBridgeCapacitor && rows[index].jumpBridgeCapacitor) {
+      next = { ...next, jumpBridgeCapacitor: rows[index].jumpBridgeCapacitor };
+    }
     rows[index] = next;
   } else {
+    next = normalizeStructureRecord(withInitialJumpBridgeCapacitor(next));
     rows.push(next);
   }
 
@@ -2757,6 +2817,9 @@ function resolveStructureReinforcementDurationSeconds(structure, reinforcementTy
   if (isStructureActiveWarHQ(structure)) {
     return STRUCTURE_TIMER_SECONDS.WAR_HQ_ARMOR_REINFORCE;
   }
+  if (isInsurgencyFobStructure(structure)) {
+    return STRUCTURE_TIMER_SECONDS.ARMOR_REINFORCE_INSURGENCY_FOB;
+  }
   if (size === STRUCTURE_SIZE.MEDIUM) {
     return MEDIUM_ARMOR_REINFORCE_SECONDS_BY_BAND[resolveStructureSpaceBand(structure)];
   }
@@ -2770,6 +2833,11 @@ function resolveStructureReinforcementJitterSeconds(structure) {
   }
   if (size === STRUCTURE_SIZE.MEDIUM) {
     return STRUCTURE_TIMER_SECONDS.REINFORCE_EXIT_JITTER_MEDIUM;
+  }
+  // The client's ApplyJitterToReinforceExitTime tests flex, medium, then
+  // Insurgency FOB, then falls to the default.
+  if (isInsurgencyFobStructure(structure)) {
+    return STRUCTURE_TIMER_SECONDS.REINFORCE_EXIT_JITTER_INSURGENCY_FOB;
   }
   return STRUCTURE_TIMER_SECONDS.REINFORCE_EXIT_JITTER_DEFAULT;
 }
@@ -4989,6 +5057,7 @@ function listAssetSafetyWraps() {
 
 Object.assign(module.exports, {
   STRUCTURE_TYPES_TABLE,
+  normalizeJumpBridgeCapacitorState,
   STRUCTURES_TABLE,
   STRUCTURE_ASSET_SAFETY_TABLE,
   ensureStructureTypes,
@@ -5068,6 +5137,8 @@ Object.assign(module.exports, {
     resolveStructureRepairingValue,
     getShipDockClass,
     resolveStructureUnanchoringSeconds,
+    resolveStructureReinforcementDurationSeconds,
+    resolveStructureReinforcementJitterSeconds,
     awaitPendingMarketOrderCancellationTasksForTests,
   },
 });

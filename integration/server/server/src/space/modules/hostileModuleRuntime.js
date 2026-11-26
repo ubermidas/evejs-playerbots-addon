@@ -1099,6 +1099,22 @@ function removeTargetHostileRecord(targetEntity, sourceEntity, effectState) {
   return existing;
 }
 
+function isShipModuleHostileTarget(scene, sourceEntity, targetEntity, family) {
+  if (family === HOSTILE_FAMILY_WEB && sourceEntity.kind === "ship" && targetEntity.kind === "fighter") {
+    return require("../../services/fighter/fighterRuntime")
+      .hasCurrentFighterController(scene, targetEntity);
+  }
+  return targetEntity.kind === "ship" || ["array", "dread"].includes(targetEntity.homefrontRole);
+}
+
+function refreshHostileTargetDerivedState(scene, targetEntity, options) {
+  if (targetEntity.kind === "fighter") {
+    return require("../../services/fighter/fighterRuntime")
+      .refreshFighterEwarTargetDerivedState(scene, targetEntity, true);
+  }
+  return scene.refreshShipEntityDerivedState(targetEntity, options);
+}
+
 function resolveHostileModuleActivation({
   scene,
   entity,
@@ -1141,7 +1157,7 @@ function resolveHostileModuleActivation({
       : scene.getEntityByID(normalizedTargetID);
   if (
     !targetEntity ||
-    (targetEntity.kind !== "ship" && !["array", "dread"].includes(targetEntity.homefrontRole)) ||
+    !isShipModuleHostileTarget(scene, entity, targetEntity, definition.family) ||
     !canEntitiesInteractLocally(entity, targetEntity)
   ) {
     return {
@@ -1561,6 +1577,22 @@ function resolveNosTransferAllowed(sourceEntity, targetEntity, effectState, call
   return sourceCapAmount + 1e-6 < targetCapAmount;
 }
 
+let achievementRuntime = null;
+// Reports a landed cycle to the achievements (Apply Stasis Webifier, Energy Neutralizer and the like).
+// Bookkeeping only: it must never fail or slow the module cycle.
+function noteAchievementHostileCycle(scene, source, target, effectState, nowMs, effective, appliedAmount) {
+  try {
+    if (!achievementRuntime) {
+      achievementRuntime = require("../../services/achievement/achievementRuntime");
+    }
+    achievementRuntime.recordHostileModuleCycle({
+      scene, source, target, effectState, nowMs, effective, appliedAmount,
+    });
+  } catch (error) {
+    // The cycle is already applied.
+  }
+}
+
 function executeHostileModuleCycle({
   scene,
   session,
@@ -1584,7 +1616,7 @@ function executeHostileModuleCycle({
     !targetEntity ||
     (effectState.hostileFamily === HOSTILE_FAMILY_FIGHTER_TACKLE
       ? !["drone", "fighter"].includes(targetEntity.kind)
-      : targetEntity.kind !== "ship" && !["array", "dread"].includes(targetEntity.homefrontRole)) ||
+      : !isShipModuleHostileTarget(scene, entity, targetEntity, effectState.hostileFamily)) ||
     !canEntitiesInteractLocally(entity, targetEntity)
   ) {
     return {
@@ -1659,6 +1691,7 @@ function executeHostileModuleCycle({
         callbacks.setEntityCapacitorRatio(targetEntity, previousTargetChargeAmount / targetCapCapacity);
         return { ...committed, stopReason: "persistence" };
       }
+      noteAchievementHostileCycle(scene, entity, targetEntity, effectState, nowMs, true, appliedAmount);
       if ((!committed.handled || !committed.sealedItemIDs?.includes(Number(targetEntity.itemID))) &&
           callbacks.persistEntityCapacitorRatio) {
         callbacks.persistEntityCapacitorRatio(targetEntity);
@@ -1765,6 +1798,7 @@ function executeHostileModuleCycle({
         if (sourceCapCapacity > 0) callbacks.setEntityCapacitorRatio(entity, previousSourceChargeAmount / sourceCapCapacity);
         return { ...committed, stopReason: "persistence" };
       }
+      noteAchievementHostileCycle(scene, entity, targetEntity, effectState, nowMs, true, transferableAmount);
       if (targetCapCapacity > 0) {
         if ((!committed.handled || !committed.sealedItemIDs?.includes(Number(targetEntity.itemID))) &&
             callbacks.persistEntityCapacitorRatio) {
@@ -1806,6 +1840,12 @@ function executeHostileModuleCycle({
     };
   }
 
+  noteAchievementHostileCycle(
+    scene, entity, targetEntity, effectState, nowMs,
+    refreshResult.data.effectApplied !== false && refreshResult.data.multiplier > 0 &&
+      resolveTargetResistanceMultiplier(targetEntity, effectState.hostileResistanceAttributeID) > 0,
+    0,
+  );
   return {
     success: true,
     data: {
@@ -1909,6 +1949,7 @@ module.exports = {
   resolveHostileReach,
   resolveHostileModuleActivation,
   resolveTargetResistanceMultiplier,
+  refreshHostileTargetDerivedState,
   refreshHostileModuleState,
   applyHostileModuleState,
   removeHostileModuleState,

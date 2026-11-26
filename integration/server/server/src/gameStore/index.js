@@ -187,6 +187,10 @@ const configuredMapSeconds = Number(process.env.EVEJS_PLAYER_BOTS_MAP_SAVE_SECON
 const MAP_FLUSH_MS = (Number.isInteger(configuredMapSeconds) && configuredMapSeconds >= 2 &&
   configuredMapSeconds <= 120 ? configuredMapSeconds : 60) * 1000;
 const DIRECT_COMMIT_TABLES = new Set(["playerBots", "scheduledJobs", "mapTelemetry"]);
+// A table written more often than the debounce would otherwise never flush
+// while play continues. Its first unsaved write starts this deadline, and the
+// debounce never pushes the flush past it.
+const FLUSH_MAX_WAIT_MS = 10_000;
 // A failed flush is retried after twice the previous wait (4 s, 8 s, ...), up
 // to this cap, until a flush of that table succeeds.
 const FLUSH_RETRY_MAX_DELAY_MS = 60_000;
@@ -565,6 +569,17 @@ function persistenceOwnerAcquireOptions() {
   };
 }
 
+function configureWorldWalAutoCheckpoint() {
+  if (
+    PROCESS_ROLE === persistenceRoles.ROLE.WORLD &&
+    persistenceWorker.isEnabled() &&
+    persistenceWorker.isActive()
+  ) {
+    // The worker's lease renewals commit even during synchronous world writes.
+    sqliteStore.disableWalAutoCheckpoint();
+  }
+}
+
 function acquirePersistenceOwner(options = {}) {
   if (!OWNS_PERSISTENCE) return null;
   if (persistenceOwnerFailure) throw persistenceOwnerFailure;
@@ -586,6 +601,7 @@ function acquirePersistenceOwner(options = {}) {
         renewMs: PERSISTENCE_OWNER_RENEW_MS,
       },
     );
+    configureWorldWalAutoCheckpoint();
   }
   startPersistenceOwnerRenewal();
   if (firstAcquisition) {
@@ -675,6 +691,7 @@ function openSqliteForProcessRole() {
     sqliteStore.init(SQLITE_DB_PATH, { readOnly });
     sqliteRecoveryRequired = !readOnly;
     if (!readOnly) {
+      configureWorldWalAutoCheckpoint();
       warnOnceWhenMostlyFreePages();
     }
   }
@@ -772,6 +789,7 @@ function getTotalWriteGeneration() {
 }
 const dirty = new Set();     // tables that need flushing
 const flushTimers = {};      // table name → pending setTimeout id
+const flushDeadlines = {};   // table name → latest flush time, performance.now() ms
 const flushRetryDelays = {}; // table name → wait before the last failed flush's retry
 const tableFlushHolds = new Map();
 const transientPaths = {};   // table name → Set of cache paths excluded from disk flush
@@ -780,6 +798,7 @@ const transientPaths = {};   // table name → Set of cache paths excluded from 
 const transientRowIndexes = new Map();
 const flushBaselines = {};   // sqlite table → Map(key → last-persisted JSON string)
 const inFlightFlushes = new Map(); // sqlite table → exact unacknowledged operation
+const deferredReceipts = new Map();
 const lastCompletedPersistenceOperationId = new Map(); // table → durable monotonic ID
 let preloaded = false;
 
@@ -1607,7 +1626,14 @@ function handlePersistenceWorkerRecovered(operations = []) {
       throw new Error("persistence recovery callback contained an invalid operation");
     }
     const inFlight = inFlightFlushes.get(operation.table);
-    if (inFlight) {
+    if (inFlight?.batch) {
+      if (operation.operationId === inFlight.batch.previousOperationId) continue;
+      if (JSON.stringify(operation.upserts) !== JSON.stringify(inFlight.batch.upserts) ||
+          JSON.stringify(operation.deletes) !== JSON.stringify(inFlight.batch.deletes)) {
+        throw new Error(`recovered persistence operation ${operation.operationId} does not match ${operation.table}`);
+      }
+      finishDeferredFlush(inFlight, operation);
+    } else if (inFlight) {
       if (inFlight.operationId !== operation.operationId) {
         throw new Error(
           `stale recovery ${operation.operationId} cannot resolve ` +
@@ -1652,16 +1678,6 @@ function flushSqliteTable(table, options = {}) {
   persistenceRoles.assertRoleMayMutateTable(PROCESS_ROLE, table, "flush");
   assertPersistenceOwnerHealthy();
   ensureSqliteReady();
-  if (
-    persistenceWorker.isEnabled() &&
-    !persistenceWorker.isActive() &&
-    inFlightFlushes.size > 0
-  ) {
-    // A replacement controller/worker must reconcile the prior durable journal
-    // before a new batch is created. This is triggered by the next real flush
-    // of a dirty table: a write's debounce or a failed flush's retry.
-    persistenceWorker.recover(SQLITE_DB_PATH);
-  }
   if (inFlightFlushes.has(table)) {
     // Per-table single-flight is part of the persistence protocol. A second
     // diff against the still-unacknowledged baseline could omit a tombstone
@@ -1738,61 +1754,47 @@ function flushSqliteTable(table, options = {}) {
     return 0;
   }
 
-  const useWorker = persistenceWorker.isEnabled() && options.sync !== true;
-  if (!useWorker && DIRECT_COMMIT_TABLES.has(table)) {
+  if (options.pendingBatches) {
+    options.pendingBatches.push({ table, upserts, deletes });
+    return 0;
+  }
+
+  // Synchronous flushes of the add-on's high-volume tables commit their rows
+  // directly. Deferred worker batches above keep the journal protocol.
+  if (DIRECT_COMMIT_TABLES.has(table)) {
     sqliteStore.commitSynchronousChanges(table, upserts, deletes, requirePersistenceOwnerFence());
     advanceFlushBaseline(table, upserts, deletes);
     fullDirty.delete(table);
     delete dirtyRowKeys[table];
     return upserts.length + deletes.length;
   }
-
-  // The journal INSERT is synchronous by design: the exact batch and its
-  // AUTOINCREMENT identity must be durable before dirty tracking is released or
-  // any asynchronous worker can observe the operation.
   const operation = sqliteStore.enqueuePersistenceOperation(
     table,
     upserts,
     deletes,
     requirePersistenceOwnerFence(),
   );
-  inFlightFlushes.set(table, { ...operation, submittedToWorker: useWorker });
+  trackSqliteFlushOperation(operation);
+  return dispatchSqliteFlushOperation(operation);
+}
+
+function trackSqliteFlushOperation(operation) {
+  const { table } = operation;
+  inFlightFlushes.set(table, operation);
   fullDirty.delete(table);
   delete dirtyRowKeys[table];
+}
 
-  // A synchronous caller may block, so it reconciles the journal directly on
-  // the main connection. Async writes retain the outbox row until the matching
-  // worker acknowledgment is durably consumed.
-  if (useWorker) {
-    try {
-      persistenceWorker.submitWrite(SQLITE_DB_PATH, table, upserts, deletes, {
-        operationId: operation.operationId,
-      });
-    } catch (error) {
-      // The exact journal row and in-flight record deliberately remain intact.
-      // Startup or an explicit synchronous reconciliation can replay it without
-      // substituting an approximate full-state diff.
-      throw error;
-    }
-  } else {
-    try {
-      const reconciled = sqliteStore.reconcilePersistenceOperation(
-        operation.operationId,
-        table,
-        requirePersistenceOwnerFence(),
-      );
-      if (!reconciled) {
-        throw new Error(
-          `persistence operation ${operation.operationId} disappeared before reconciliation`,
-        );
-      }
-    } catch (error) {
-      // The journal remains authoritative if the transaction rolled back.
-      throw error;
-    }
-    advanceFlushBaseline(table, operation.upserts, operation.deletes);
-    inFlightFlushes.delete(table);
+function dispatchSqliteFlushOperation(operation) {
+  const { table, upserts, deletes } = operation;
+  const reconciled = sqliteStore.reconcilePersistenceOperation(
+    operation.operationId, table, requirePersistenceOwnerFence(),
+  );
+  if (!reconciled) {
+    throw new Error(`persistence operation ${operation.operationId} disappeared before reconciliation`);
   }
+  advanceFlushBaseline(table, upserts, deletes);
+  inFlightFlushes.delete(table);
   return upserts.length + deletes.length;
 }
 
@@ -1811,6 +1813,20 @@ function handlePersistenceWorkerError(table, error, failure) {
   }
 }
 persistenceWorker.onAcknowledged(handlePersistenceWorkerAcknowledged);
+persistenceWorker.onDeferredCleanup((table, operationId) => {
+  if (deferredReceipts.get(table) === operationId) deferredReceipts.delete(table);
+});
+// A refused row is set aside so the rest of its batch, its table and the next
+// start still save. The writer that produced it has a bug; name the row loudly.
+sqliteStore.onRejectedRows((rows) => {
+  for (const row of rows) {
+    dbErr(
+      `save refused ${row.kind} of ${row.table} row ${JSON.stringify(row.key)} ` +
+        `(operation ${row.operationId}): ${row.error}. The rest of the save went through; ` +
+        "the refused row is kept in _persistence_rejected_rows.",
+    );
+  }
+});
 persistenceWorker.onRecovered(handlePersistenceWorkerRecovered);
 persistenceWorker.onError(handlePersistenceWorkerError);
 persistenceWorker.onOwnerError(failPersistenceOwner);
@@ -1929,16 +1945,26 @@ function scheduleFlush(table) {
     return;
   }
 
+  // performance.now() follows the same real clock as setTimeout; the harness
+  // may drive Date.now() as game time.
+  const now = performance.now();
+  if (flushDeadlines[table] === undefined) flushDeadlines[table] = now + FLUSH_MAX_WAIT_MS;
+  const delayMs = Math.max(0, Math.min(FLUSH_DELAY_MS, flushDeadlines[table] - now));
   flushTimers[table] = setTimeout(() => {
     flushTable(table);
-  }, mapBatch ? MAP_FLUSH_MS : FLUSH_DELAY_MS);
+  }, mapBatch ? MAP_FLUSH_MS : delayMs);
   if (mapBatch) flushTimers[table].unref?.();
 }
 
-function flushTable(table) {
+function flushTable(table, options = {}) {
+  if (!options.pendingBatches && persistenceWorker.isEnabled() && isSqliteTable(table)) {
+    flushTablesAsync([table]);
+    return;
+  }
   if (tableFlushHolds.has(table)) return;
   if (!dirty.has(table)) return;
   dirty.delete(table);
+  delete flushDeadlines[table];
   if (flushTimers[table]) {
     clearTimeout(flushTimers[table]);
   }
@@ -1947,18 +1973,102 @@ function flushTable(table) {
   try {
     persistenceRoles.assertRoleMayMutateTable(PROCESS_ROLE, table, "flush");
     assertPersistenceOwnerHealthy();
+    const pendingCount = options.pendingBatches?.length;
     if (isSqliteTable(table)) {
-      flushSqliteTable(table);
+      flushSqliteTable(table, options);
     } else {
       const data = buildFlushSnapshot(table);
       const json = JSON.stringify(data, null, 2);
       safeWriteFileSync(dataFilePath(table), json);
     }
-    delete flushRetryDelays[table];
+    if (pendingCount === options.pendingBatches?.length) {
+      delete flushRetryDelays[table];
+    }
   } catch (err) {
-    dbErr(`flush FAILED for ${table}: ${err.message}`);
-    dirty.add(table);
-    scheduleFlushRetry(table);
+    onFlushFailure(table, err);
+  }
+}
+
+function onFlushFailure(table, error) {
+  dbErr(`flush FAILED for ${table}: ${error.message}`);
+  dirty.add(table);
+  scheduleFlushRetry(table);
+}
+
+function finishDeferredFlush(entry, operation) {
+  const { table, upserts, deletes } = entry.batch;
+  if (inFlightFlushes.get(table) !== entry) return;
+  inFlightFlushes.set(table, { table, upserts, deletes, operationId: operation.operationId });
+  handlePersistenceWorkerAcknowledged(operation);
+  deferredReceipts.set(table, operation.operationId);
+  delete flushRetryDelays[table];
+}
+
+function flushTablesAsync(tables) {
+  const uniqueTables = new Set(tables);
+  if (!persistenceWorker.isEnabled()) {
+    for (const table of uniqueTables) {
+      flushTable(table);
+    }
+    return;
+  }
+
+  const pendingBatches = [];
+  const entries = [];
+  for (const table of uniqueTables) {
+    if (tableFlushHolds.has(table)) continue;
+    let inFlight = inFlightFlushes.get(table);
+    if (inFlight) {
+      if (flushTimers[table]) clearTimeout(flushTimers[table]);
+      delete flushTimers[table];
+      if (!inFlight.batch) {
+        const { upserts, deletes } = inFlight;
+        inFlight = { batch: { table, upserts, deletes }, handle: null };
+        inFlightFlushes.set(table, inFlight);
+      }
+      if (!inFlight.handle) {
+        entries.push(inFlight);
+      }
+      continue;
+    }
+    flushTable(table, { pendingBatches });
+  }
+  for (const batch of pendingBatches) {
+    const { table } = batch;
+    batch.previousOperationId = deferredReceipts.get(table);
+    const entry = { batch, handle: null };
+    inFlightFlushes.set(table, entry);
+    fullDirty.delete(table);
+    delete dirtyRowKeys[table];
+    entries.push(entry);
+  }
+  if (!entries.length) return;
+
+  function complete(result) {
+    for (const [index, entry] of entries.entries()) {
+      const { table } = entry.batch;
+      if (inFlightFlushes.get(table) !== entry) continue;
+      entry.handle = null;
+      const operation = result.operations?.[index];
+      if (operation?.error || operation?.table !== table || !Number.isSafeInteger(operation.operationId)) {
+        onFlushFailure(table, new Error(operation?.error || result.error || "invalid deferred persistence result"));
+        continue;
+      }
+      finishDeferredFlush(entry, operation);
+      try {
+        persistenceWorker.acknowledgeDeferred(table, operation.operationId);
+      } catch (error) {
+        dbErr(`could not retire deferred persistence receipt for ${table}: ${error.message}`);
+      }
+    }
+  }
+
+  try {
+    requirePersistenceOwnerFence();
+    const handle = persistenceWorker.submitDeferred(SQLITE_DB_PATH, entries.map(({ batch }) => batch), complete);
+    for (const entry of entries) entry.handle = handle;
+  } catch (error) {
+    complete({ error: error.message });
   }
 }
 
@@ -1995,18 +2105,28 @@ function reconcileInFlightFlush(table) {
   if (!inFlight) {
     return false;
   }
-  const reconciled = inFlight.submittedToWorker
-    ? persistenceWorker.reconcileWrite(SQLITE_DB_PATH, inFlight.operationId)
-    : sqliteStore.reconcilePersistenceOperation(
+  if (inFlight.batch) {
+    if (inFlight.handle) {
+      const result = inFlight.handle.wait();
+      if (inFlightFlushes.get(table) !== inFlight) return true;
+      if (inFlight.handle) {
+        throw new Error(result?.error || `deferred persistence write for ${table} was not confirmed`);
+      }
+    }
+    const ownerFence = requirePersistenceOwnerFence();
+    const [operation] = sqliteStore.journalDeferredBatches([inFlight.batch], ownerFence);
+    if (operation.state !== "applied" && !sqliteStore.applyPersistenceOperation(operation.operationId, table, ownerFence)) {
+      throw new Error(`persistence operation ${operation.operationId} disappeared before apply`);
+    }
+    finishDeferredFlush(inFlight, operation);
+    return true;
+  }
+  const reconciled = sqliteStore.reconcilePersistenceOperation(
       inFlight.operationId,
       table,
       requirePersistenceOwnerFence(),
     );
-  // The controller normally invokes the acknowledgment callback itself. Keep
-  // this fallback explicit for injected controllers used by focused tests.
-  if (inFlightFlushes.get(table) === inFlight) {
-    handlePersistenceWorkerAcknowledged(reconciled || inFlight);
-  }
+  handlePersistenceWorkerAcknowledged(reconciled || inFlight);
   const remaining = inFlightFlushes.get(table);
   if (remaining && remaining.operationId === inFlight.operationId) {
     throw new Error(
@@ -2045,6 +2165,10 @@ function flushTableSync(table, options = {}) {
       return { success: true, errorMsg: null, flushed: reconciled };
     }
     if (sqliteTable) {
+      if (deferredReceipts.has(table)) {
+        sqliteStore.acknowledgeDeferredOperation(table, deferredReceipts.get(table), requirePersistenceOwnerFence());
+        deferredReceipts.delete(table);
+      }
       // sync: true reconciles directly on the main connection. Any earlier
       // async operation was resolved above before a newer diff was computed.
       flushSqliteTable(table, { sync: true });
@@ -2055,6 +2179,7 @@ function flushTableSync(table, options = {}) {
       );
     }
     dirty.delete(table);
+    delete flushDeadlines[table];
     if (options.log === true) {
       dbLog(`  ${pc.cyan(table)} ${pc.green("flushed")}`);
     }
@@ -2062,7 +2187,36 @@ function flushTableSync(table, options = {}) {
   } catch (err) {
     dbErr(`sync flush FAILED for ${table}: ${err.message}`);
     dirty.add(table);
+    if (options.retryOnFailure === true) scheduleFlushRetry(table);
     return { success: false, errorMsg: "FLUSH_ERROR", flushed: false };
+  }
+}
+
+async function flushTableDurable(table) {
+  if (!persistenceWorker.isEnabled() || !isSqliteTable(table)) return flushTableSync(table);
+  persistenceRoles.assertRoleMayMutateTable(PROCESS_ROLE, table, "flush");
+  assertPersistenceOwnerHealthy();
+  if (!ensureCached(table)) return { success: false, errorMsg: "TABLE_NOT_FOUND", flushed: false };
+  let flushed = false;
+  while (true) {
+    if (tableFlushHolds.has(table)) return { success: false, errorMsg: "TABLE_FLUSH_HELD", flushed: false };
+    let entry = inFlightFlushes.get(table);
+    const coversCurrent = !entry || !dirty.has(table);
+    if (!entry?.handle) {
+      flushTablesAsync([table]);
+      entry = inFlightFlushes.get(table);
+    }
+    if (!entry) {
+      return dirty.has(table)
+        ? { success: false, errorMsg: "FLUSH_ERROR", flushed: false }
+        : { success: true, errorMsg: null, flushed };
+    }
+    if (!entry.handle || (await entry.handle.waitAsync()).error) {
+      return { success: false, errorMsg: "FLUSH_ERROR", flushed: false };
+    }
+    if (inFlightFlushes.get(table) === entry) return { success: false, errorMsg: "FLUSH_ERROR", flushed: false };
+    if (coversCurrent) return { success: true, errorMsg: null, flushed: true };
+    flushed = true;
   }
 }
 
@@ -2096,6 +2250,36 @@ function flushTablesSync(tables = []) {
   };
 }
 
+// The shutdown flush writes on the main connection. A table whose last write is still on the
+// persistence worker would be written by both connections at once, and whichever waits longer
+// than SQLite's busy timeout (5 s) fails with "database is locked". A large table can take
+// longer than that, so the shutdown flush first waits for the worker to finish. The wait renews
+// the owner lease between slices, since the worker's writes need a live lease.
+const SHUTDOWN_WORKER_DRAIN_SLICE_MS = 5_000;
+const SHUTDOWN_WORKER_DRAIN_LIMIT_MS = 120_000;
+
+function drainPersistenceWorkerBeforeShutdownFlush() {
+  const onWorker = [...inFlightFlushes.values()].some((flush) => flush.handle);
+  if (!onWorker || !persistenceWorker.isActive()) return null;
+  // A bounded number of slices, so a drain that answers at once cannot spin until a deadline.
+  const slices = Math.ceil(SHUTDOWN_WORKER_DRAIN_LIMIT_MS / SHUTDOWN_WORKER_DRAIN_SLICE_MS);
+  let result = null;
+  try {
+    for (let slice = 0; slice < slices; slice += 1) {
+      renewPersistenceOwnerLeaseAtBoundary();
+      result = persistenceWorker.drain(SHUTDOWN_WORKER_DRAIN_SLICE_MS);
+      if (!result || result.drained || !result.timedOut) break;
+    }
+  } catch (error) {
+    dbWarn(`shutdown flush: waiting for the persistence worker failed: ${error.message}`);
+    return null;
+  }
+  if (result && result.error) {
+    dbWarn(`shutdown flush: ${result.error}`);
+  }
+  return result;
+}
+
 /**
  * Synchronously flush ALL dirty tables.  Called on shutdown so
  * nothing is lost when the process exits.
@@ -2115,6 +2299,7 @@ function flushAllSync() {
   }
 
   dbLog(`shutdown flush — writing ${dirtyTables.length} dirty table(s)...`);
+  drainPersistenceWorkerBeforeShutdownFlush();
 
   let success = true;
   for (const table of dirtyTables) {
@@ -2426,6 +2611,77 @@ function readPersisted(table, pth) {
   }
 }
 
+// The durable value at a path, read from this process's own memory instead of
+// SQLite. The owner of a table is its only writer, and its flush baseline holds
+// the exact JSON of every row SQLite has acknowledged. An explicit flush's
+// durable journal row can be overlaid; a deferred batch awaiting confirmation
+// cannot. Reading the same rows back through a typed table's SQLite view rebuilds
+// every row of the table (about 240 ms for the dev store's dungeon instances).
+// A process that does not own the table, or has not loaded it, reads SQLite.
+function durableRowsFromMemory(table) {
+  if (!OWNS_PERSISTENCE || !persistenceRoles.roleMayMutateTable(PROCESS_ROLE, table)) return null;
+  const baseline = flushBaselines[table];
+  if (!baseline || !Object.prototype.hasOwnProperty.call(cache, table)) return null;
+  const inFlight = inFlightFlushes.get(table);
+  if (!inFlight || inFlight.batch) return baseline;
+  const rows = new Map(baseline);
+  for (const [rowKey, serialized] of inFlight.upserts || []) rows.set(rowKey, serialized);
+  for (const rowKey of inFlight.deletes || []) rows.delete(rowKey);
+  return rows;
+}
+
+function selectDurableRowsPath(table, rows, segments) {
+  const parseRows = (accept) => {
+    const parsed = {};
+    const keys = [...rows.keys()].filter(accept);
+    // SQLite returns typed (view) rows by key and plain table rows by insertion.
+    if (sqliteStore.isSharedSchemaTable(table)) keys.sort();
+    for (const key of keys) parsed[key] = JSON.parse(rows.get(key));
+    return parsed;
+  };
+  if (segments.length === 0) {
+    return { exists: true, value: sqliteStore.assembleFromRows(table, parseRows(() => true)) };
+  }
+  const [first, second] = segments;
+  const groups = sqliteStore.rowGroupsFor(table) || [];
+  if (groups.includes(first)) {
+    const prefix = `${first}${sqliteStore.ROW_KEY_SEP}`;
+    if (segments.length === 1) {
+      return sqliteStore.selectPath(
+        sqliteStore.assembleFromRows(table, parseRows((key) => key === first || key.startsWith(prefix))),
+        segments,
+      );
+    }
+    // An entity row overrides the legacy group blob, as in loadExistingTablePath.
+    const entityKey = `${prefix}${second}`;
+    if (rows.has(entityKey)) return sqliteStore.selectPath(JSON.parse(rows.get(entityKey)), segments.slice(2));
+    const legacy = rows.has(first) ? JSON.parse(rows.get(first)) : null;
+    const group = legacy && typeof legacy === "object" && !Array.isArray(legacy) ? legacy : {};
+    return sqliteStore.selectPath(group, segments.slice(1));
+  }
+  return rows.has(first)
+    ? sqliteStore.selectPath(JSON.parse(rows.get(first)), segments.slice(1))
+    : { exists: false, value: null };
+}
+
+// readPersisted's answer, served from memory where this process owns the table.
+function readDurable(table, pth) {
+  if (!isSqliteTable(table)) {
+    return { success: false, errorMsg: "SQLITE_TABLE_REQUIRED", data: null };
+  }
+  const rows = durableRowsFromMemory(table);
+  if (!rows) return readPersisted(table, pth);
+  try {
+    const selected = selectDurableRowsPath(table, rows, getSegments(pth));
+    if (!selected.exists) return { success: false, errorMsg: "ENTRY_NOT_FOUND", data: null };
+    // Parsed fresh from the stored JSON, so isolated from the cache like readPersisted.
+    return { success: true, errorMsg: null, data: selected.value };
+  } catch (error) {
+    log.error(`[DATABASE DURABLE READ ERROR] ${error.message}`);
+    return { success: false, errorMsg: "READ_ERROR", data: null };
+  }
+}
+
 function readPersistedAbyssalInstances(characterID = 0) {
   try {
     ensureSqliteReady();
@@ -2602,6 +2858,7 @@ module.exports = {
   getTableWriteGeneration,
   getTotalWriteGeneration,
   readPersisted,
+  readDurable,
   readPersistedAbyssalInstances,
   readPersistedIncursionPending,
   readPersistedKillmailsForCharacter: characterID => readPersistedCareerRows("killmails", characterID),
@@ -2622,6 +2879,8 @@ module.exports = {
   // SQLite operation is journaled synchronously and the transaction remains
   // off-thread when enabled.
   flushTableAsync: flushTable,
+  flushTablesAsync,
+  flushTableDurable,
   flushTableSync,
   flushTablesSync,
   flushAllSync,

@@ -4742,6 +4742,15 @@ function getMyContractEscrow(session) {
       if (active && issuedByMe && !contract.auctionWinnerClaimed) itemsEscrow += (contract.items || []).filter(row => row.inCrate).length;
       continue;
     }
+    if (
+      contract.type === CONTRACT_TYPE.COURIER &&
+      contract.status === CONTRACT_STATUS.IN_PROGRESS &&
+      characterID > 0 &&
+      contract.acceptorWallet?.kind === "character" &&
+      contract.acceptorWallet.ownerID === characterID
+    ) {
+      iskEscrow += normalizeMoney(contract.collateralEscrow, 0);
+    }
     if (!issuedByMe) {
       continue;
     }

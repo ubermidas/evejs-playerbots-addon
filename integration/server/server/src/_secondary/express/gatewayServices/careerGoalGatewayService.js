@@ -5,39 +5,6 @@ const catalog = require("../../../services/career/careerCatalog");
 const characters = require("../../../services/character/characterState");
 const PREFIX = "eve_public.career.goal.api.";
 const HANDLED_REQUEST_TYPES = ["GetDefinitions", "GetAll", "ClaimReward"].map(method => `${PREFIX}${method}Request`);
-const pendingAchievementCareerSyncs = new Set();
-let achievementCareerSyncTimer = null;
-
-function queueAchievementCareerSync(characterID) {
-  const id = Number(characterID);
-  if (!Number.isSafeInteger(id) || id <= 0) return;
-  pendingAchievementCareerSyncs.add(id);
-  if (achievementCareerSyncTimer) return;
-  // Mining and combat achievements can progress during the space tick. Batch
-  // their career projection outside that callback so it never scans durable
-  // owner tables while the scene is advancing.
-  achievementCareerSyncTimer = setTimeout(() => {
-    achievementCareerSyncTimer = null;
-    const charactersToSync = [...pendingAchievementCareerSyncs];
-    pendingAchievementCareerSyncs.clear();
-    let index = 0;
-    const syncNext = () => {
-      if (index >= charactersToSync.length) return;
-      const currentID = charactersToSync[index++];
-      setImmediate(() => {
-        try {
-          const result = require("../../../services/career/careerProgress").syncAchievementProgress(currentID);
-          if (!result.success) require("../../../utils/logger").warn(`[Career] native progress awaits retry: ${result.errorMsg}`);
-        } catch (error) {
-          require("../../../utils/logger").warn(`[Career] native progress awaits retry: ${error.message}`);
-        }
-        syncNext();
-      });
-    };
-    syncNext();
-  }, 1000);
-  if (typeof achievementCareerSyncTimer.unref === "function") achievementCareerSyncTimer.unref();
-}
 function identifier(id) { return { uuid: uuidStringToBuffer(id) }; }
 function buildDefinition(row) {
   return { goal: identifier(row.id), attributes: {
@@ -70,42 +37,26 @@ function buildProgress(characterID, row, snapshot = null) {
 }
 let publisher, listening = false;
 // One reprocessing settlement reports a notice per input stack, all in one turn, and
-// careerProgress.sync() reconciles every career source: 420 stacks held the event loop
-// for 24 s. Run one sync per character per turn instead. Career progress is a projection
-// of durable owner state and handleRequest syncs before it reads, so a turn's delay
-// cannot lose progress or show a stale answer. A burst spread over several turns still
-// costs one sync per turn.
-const pendingCareerSyncs = new Map();
+// reconciling every stack held the event loop for 24 s. Batch by character per
+// turn; the projection also folds refreshes received while its save is pending.
+const pendingCareerSyncs = new Set();
 let careerSyncScheduled = false;
+async function refreshCareerProgress(characterID) {
+  try {
+    const result = await require("../../../services/career/careerProgress").syncAsync(characterID);
+    if (!result.success) require("../../../utils/logger").warn(`[Career] progress awaits retry: ${result.errorMsg}`);
+  } catch (error) { require("../../../utils/logger").warn(`[Career] progress awaits retry: ${error.message}`); }
+}
 function runPendingCareerSyncs() {
   careerSyncScheduled = false;
-  const pending = [...pendingCareerSyncs.entries()];
+  const characterIDs = [...pendingCareerSyncs];
   pendingCareerSyncs.clear();
   // Writes are refused once a shutdown starts. The next sync rebuilds this from the owners.
   if (require("../../../gameStore").isShutdownInProgress()) return;
-  for (const [characterID, syncOptions] of pending) {
-    try {
-      const result = require("../../../services/career/careerProgress").sync(characterID, syncOptions);
-      if (!result.success) require("../../../utils/logger").warn(`[Career] progress awaits retry: ${result.errorMsg}`);
-    } catch (error) { require("../../../utils/logger").warn(`[Career] progress awaits retry: ${error.message}`); }
-  }
+  for (const characterID of characterIDs) void refreshCareerProgress(characterID);
 }
-function scheduleCareerSync(characterID, syncOptions = {}) {
-  const id = Number(characterID);
-  if (!Number.isSafeInteger(id) || id <= 0) return;
-  const previous = pendingCareerSyncs.get(id);
-  const nextIsNarrow = syncOptions && syncOptions.reconcileSources === false &&
-    Array.isArray(syncOptions.sourceKinds) && syncOptions.sourceKinds.length > 0;
-  if (!previous) {
-    pendingCareerSyncs.set(id, nextIsNarrow
-      ? { reconcileSources: false, sourceKinds: [...new Set(syncOptions.sourceKinds)] }
-      : {});
-  } else if (previous.reconcileSources === false && nextIsNarrow) {
-    previous.sourceKinds = [...new Set([...(previous.sourceKinds || []), ...syncOptions.sourceKinds])];
-  } else {
-    // A full reconciliation dominates narrower projections queued in the same turn.
-    pendingCareerSyncs.set(id, {});
-  }
+function scheduleCareerSync(characterID) {
+  pendingCareerSyncs.add(characterID);
   if (careerSyncScheduled) return;
   careerSyncScheduled = true;
   setImmediate(runPendingCareerSyncs);
@@ -124,11 +75,10 @@ function createCareerGoalGatewayService(context) {
       } catch (error) { require("../../../utils/logger").warn(`[Career] progress notice failed: ${error.message}`); }
     });
     require("../../../services/achievement/achievementState").events.on("achievement-progressed", event => {
-      queueAchievementCareerSync(event.characterID);
+      if (event.deferSave) require("../../../services/career/careerProgress").scheduleCombatSync(event.characterID);
+      else scheduleCareerSync(event.characterID);
     });
-    require("../../../services/career/careerEventLedger").events.on("committed", event => {
-      scheduleCareerSync(event.characterID, event.syncOptions || {});
-    });
+    require("../../../services/career/careerEventLedger").events.on("committed", event => scheduleCareerSync(event.characterID));
   }
   return { name: "career-goals", handledRequestTypes: HANDLED_REQUEST_TYPES, getEmptySuccessResponseType: () => null,
     handleRequest(type, envelope) {
@@ -153,13 +103,14 @@ function createCareerGoalGatewayService(context) {
       // Accepted queue entries survive later catalog/progress changes. A lost
       // response must not require the original eligibility projection again.
       if (isClaim && claims.getClaim(characterID, goalID, decoded.label)) return fulfill();
-      const synced = require("../../../services/career/careerProgress").sync(characterID);
-      if (!synced.success) return respond(503, {}, synced.errorMsg);
-      if (request === `${PREFIX}GetAllRequest`) {
-        const snapshot = { claims: claims.createClaimSnapshot(characterID), progress: new Map(synced.data.map(row => [row.goalID, row])) };
-        return respond(200, { goals: catalog.list().map(row => buildProgress(characterID, row, snapshot)) });
-      }
-      return fulfill();
+      return require("../../../services/career/careerProgress").syncAsync(characterID).then(synced => {
+        if (!synced.success) return respond(503, {}, synced.errorMsg);
+        if (request === `${PREFIX}GetAllRequest`) {
+          const snapshot = { claims: claims.createClaimSnapshot(characterID), progress: new Map(synced.data.map(row => [row.goalID, row])) };
+          return respond(200, { goals: catalog.list().map(row => buildProgress(characterID, row, snapshot)) });
+        }
+        return fulfill();
+      });
     } };
 }
 module.exports = { createCareerGoalGatewayService, buildDefinition, buildProgress, HANDLED_REQUEST_TYPES };

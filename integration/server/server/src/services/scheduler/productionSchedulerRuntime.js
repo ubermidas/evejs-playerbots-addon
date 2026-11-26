@@ -33,6 +33,7 @@ const contrabandPenaltyRuntime = require(path.join(
   "../security/contrabandPenaltyState",
 ));
 const customsInspectionRuntime = require("../security/customsInspectionRuntime");
+const securityTags = require("../security/securityTagExchange");
 const skyhookRaidRuntime = require("../sovereignty/skyhookRaidRuntime");
 const sovHubFuelRuntime = require("../sovereignty/sovHubFuelRuntime");
 const selfDestructRuntime = require("../ship/selfDestructRuntime");
@@ -91,6 +92,7 @@ const corporationMemberActionRuntime = require(path.join(
   __dirname,
   "../corporation/corpMemberActionState",
 ));
+const corporationAutoRemovalRuntime = require("../corporation/corpAutoRemoval");
 const allianceApplicationRuntime = require(path.join(
   __dirname,
   "../corporation/allianceApplicationState",
@@ -267,6 +269,8 @@ function createProductionSchedulerRuntime(options = {}) {
     options.allianceFoundingRuntime || allianceFoundingRuntime;
   const corporationMemberActionOwner =
     options.corporationMemberActionRuntime || corporationMemberActionRuntime;
+  const corporationAutoRemovalOwner =
+    options.corporationAutoRemovalRuntime || corporationAutoRemovalRuntime;
   const allianceApplicationOwner =
     options.allianceApplicationRuntime || allianceApplicationRuntime;
   const allianceDepartureOwner =
@@ -360,6 +364,7 @@ function createProductionSchedulerRuntime(options = {}) {
     corporationFoundingOwner.unbindDurableScheduler(scheduler);
     allianceFoundingOwner.unbindDurableScheduler(scheduler);
     corporationMemberActionOwner.unbindDurableScheduler(scheduler);
+    corporationAutoRemovalOwner.unbindDurableScheduler(scheduler);
     allianceApplicationOwner.unbindDurableScheduler(scheduler);
     allianceDepartureOwner.unbindDurableScheduler(scheduler);
     sovereigntyCampaignOwner.unbindDurableScheduler(scheduler);
@@ -543,6 +548,9 @@ function createProductionSchedulerRuntime(options = {}) {
             corporationMemberActionOwner.handleDurableCorporationMemberAction(job),
         ));
         unregisterHandlers.push(scheduler.register(
+          corporationAutoRemovalOwner.JOB_TYPE, (job) => corporationAutoRemovalOwner.handleJob(job),
+        ));
+        unregisterHandlers.push(scheduler.register(
           allianceApplicationOwner.DURABLE_EFFECTIVE_JOB_TYPE,
           (job) =>
             allianceApplicationOwner.handleDurableAllianceApplicationEffective(job),
@@ -695,6 +703,7 @@ function createProductionSchedulerRuntime(options = {}) {
         corporationFoundingOwner.bindDurableScheduler(scheduler);
         allianceFoundingOwner.bindDurableScheduler(scheduler);
         corporationMemberActionOwner.bindDurableScheduler(scheduler);
+        corporationAutoRemovalOwner.bindDurableScheduler(scheduler);
         allianceApplicationOwner.bindDurableScheduler(scheduler);
         allianceDepartureOwner.bindDurableScheduler(scheduler);
         sovereigntyCampaignOwner.bindDurableScheduler(scheduler);
@@ -799,6 +808,7 @@ function createProductionSchedulerRuntime(options = {}) {
           corporationFoundingReconciliation,
           allianceFoundingReconciliation,
           corporationMemberActionReconciliation,
+          corporationAutoRemovalReconciliation,
           allianceApplicationReconciliation,
           allianceDepartureReconciliation,
           officeImpoundReconciliation,
@@ -842,6 +852,7 @@ function createProductionSchedulerRuntime(options = {}) {
           corporationFoundingOwner.reconcileDurableCorporationFoundings(),
           allianceFoundingOwner.reconcileDurableAllianceFoundings(),
           corporationMemberActionOwner.reconcileDurableCorporationMemberActions(),
+          corporationAutoRemovalOwner.reconcileDurableRemovals(),
           allianceApplicationOwner.reconcileDurableAllianceApplications(),
           allianceDepartureOwner.reconcileDurableAllianceDepartures(),
           officeImpoundOwner.reconcileDurableImpoundReleases(),
@@ -866,6 +877,7 @@ function createProductionSchedulerRuntime(options = {}) {
           jumpCloneOwner.reconcileDurableCloneInstalls({ receiptScan }),
           jumpBridgeOwner.reconcileDurableJumpBridgeSettlements({ receiptScan }),
           runReconciler(() => starbaseFuelOwner.reconcilePersistedControlTowerFuelStates()),
+          securityTags.recoverSecurityTagExchanges(),
         ]);
         startResult = Object.freeze({
           incursionRewardJobs: Number(incursionRewardReconciliation.scheduled) || 0,
@@ -951,6 +963,7 @@ function createProductionSchedulerRuntime(options = {}) {
               corporationMemberActionReconciliation &&
                 corporationMemberActionReconciliation.scheduled,
             ) || 0,
+          corporationAutoRemovalJobs: Number(corporationAutoRemovalReconciliation?.scheduled) || 0,
           allianceApplicationJobs:
             Number(
               allianceApplicationReconciliation &&
